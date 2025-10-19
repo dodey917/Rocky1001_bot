@@ -2,31 +2,17 @@ import os
 import logging
 import asyncio
 import sys
-import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from datetime import datetime
+from typing import Dict, List, Any
 
-# Try different PostgreSQL drivers
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    POSTGRES_DRIVER = "psycopg2"
-except ImportError as e:
-    try:
-        import pg8000
-        from pg8000 import Connection
-        POSTGRES_DRIVER = "pg8000"
-        logging.info("Using pg8000 as PostgreSQL driver")
-    except ImportError:
-        logging.error("No PostgreSQL driver available. Install psycopg2 or pg8000")
-        sys.exit(1)
-
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+
 from telegram import (
     Update, 
     Chat, 
     User, 
-    ChatMember, 
     BotCommand,
     ChatMemberUpdated
 )
@@ -40,190 +26,83 @@ from telegram.ext import (
     CallbackContext
 )
 from telegram.constants import ChatType, ChatMemberStatus
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError
 
-# Try to load .env file (for local development)
-try:
-    load_dotenv()
-except Exception:
-    pass  # Ignore if no .env file (normal on Render)
+# Load environment variables
+load_dotenv()
 
-class Config:
-    """Configuration management with Render environment support"""
+# Configure logging for Render
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+class Database:
+    """Simplified database handler inspired by HAMSAS_BOT"""
     
-    @staticmethod
-    def get_required_env(var_name: str) -> str:
-        """Get required environment variable or raise informative error"""
-        value = os.getenv(var_name)
-        if not value:
-            raise ValueError(
-                f"❌ Required environment variable '{var_name}' is not set.\n"
-                f"Please set it in your Render environment variables."
-            )
-        return value
-
-    @staticmethod
-    def get_optional_env(var_name: str, default: str = "") -> str:
-        """Get optional environment variable"""
-        return os.getenv(var_name, default)
-
-    @classmethod
-    def load_config(cls):
-        """Load and validate all configuration"""
-        config = {
-            'BOT_TOKEN': cls.get_required_env('BOT_TOKEN'),
-            'DATABASE_URL': cls.get_required_env('DATABASE_URL'),
-            'OWNER_ID': cls.get_optional_env('OWNER_ID'),
-            'OWNER_USERNAME': cls.get_optional_env('OWNER_USERNAME', ''),
-            'LOG_LEVEL': cls.get_optional_env('LOG_LEVEL', 'INFO'),
-        }
-        
-        # Validate OWNER_ID
-        if not config['OWNER_ID']:
-            raise ValueError("OWNER_ID environment variable is required")
-        
-        try:
-            config['OWNER_ID'] = int(config['OWNER_ID'])
-        except ValueError:
-            raise ValueError("OWNER_ID must be a valid integer")
-        
-        return config
-
-class DatabaseManager:
-    """Manage database connections and operations with multiple driver support"""
-    
-    def __init__(self, database_url: str):
-        self.database_url = database_url
-        self.driver = POSTGRES_DRIVER
-        logging.info(f"Using database driver: {self.driver}")
+    def __init__(self):
+        self.database_url = os.getenv('DATABASE_URL')
+        if not self.database_url:
+            logger.error("DATABASE_URL not found in environment variables")
+            raise ValueError("DATABASE_URL is required")
 
     def get_connection(self):
-        """Get database connection based on available driver"""
+        """Get database connection with retry logic"""
         try:
-            if self.driver == "psycopg2":
-                return psycopg2.connect(
-                    self.database_url,
-                    cursor_factory=RealDictCursor,
-                    connect_timeout=10
-                )
-            elif self.driver == "pg8000":
-                # Parse database URL for pg8000
-                from urllib.parse import urlparse
-                url = urlparse(self.database_url)
-                
-                # Extract connection parameters
-                dbname = url.path[1:]  # Remove leading slash
-                user = url.username
-                password = url.password
-                host = url.hostname
-                port = url.port or 5432
-                
-                conn = pg8000.connect(
-                    database=dbname,
-                    user=user,
-                    password=password,
-                    host=host,
-                    port=port,
-                    timeout=10
-                )
-                return conn
+            conn = psycopg2.connect(
+                self.database_url,
+                cursor_factory=RealDictCursor
+            )
+            return conn
         except Exception as e:
-            logging.error(f"Database connection error with {self.driver}: {e}")
+            logger.error(f"Database connection failed: {e}")
             raise
 
-    async def execute_query(self, query: str, params: tuple = None) -> Any:
-        """Execute a query with proper error handling"""
-        conn = None
+    def execute_query(self, query: str, params: tuple = None):
+        """Execute query and return results"""
+        conn = self.get_connection()
         try:
-            conn = self.get_connection()
-            
-            if self.driver == "psycopg2":
-                with conn.cursor() as cursor:
-                    cursor.execute(query, params or ())
-                    if query.strip().upper().startswith('SELECT'):
-                        result = cursor.fetchall()
-                    else:
-                        conn.commit()
-                        result = None
-            
-            elif self.driver == "pg8000":
-                cursor = conn.cursor()
+            with conn.cursor() as cursor:
                 cursor.execute(query, params or ())
                 if query.strip().upper().startswith('SELECT'):
-                    result = []
-                    columns = [desc[0] for desc in cursor.description]
-                    for row in cursor.fetchall():
-                        result.append(dict(zip(columns, row)))
+                    result = cursor.fetchall()
                 else:
                     conn.commit()
                     result = None
-                cursor.close()
-            
             return result
-            
         except Exception as e:
-            logging.error(f"Query execution error: {e}")
-            if conn:
-                conn.rollback()
+            logger.error(f"Query execution error: {e}")
+            conn.rollback()
             raise
         finally:
-            if conn:
-                conn.close()
+            conn.close()
 
-class TelegramGroupProtectionBot:
-    """Telegram bot for group protection optimized for Render"""
+class GroupProtectionBot:
+    """Simplified and optimized bot for Render"""
     
     def __init__(self):
-        # Load configuration with proper error handling
-        try:
-            self.config = Config.load_config()
-        except ValueError as e:
-            logging.critical(f"Configuration error: {e}")
-            sys.exit(1)
+        self.token = os.getenv('BOT_TOKEN')
+        if not self.token:
+            raise ValueError("BOT_TOKEN is required")
         
-        # Initialize core attributes
-        self.bot_token = self.config['BOT_TOKEN']
-        self.database_url = self.config['DATABASE_URL']
-        self.owner_id = self.config['OWNER_ID']
-        self.owner_username = self.config['OWNER_USERNAME']
+        self.owner_id = int(os.getenv('OWNER_ID', 0))
+        if not self.owner_id:
+            raise ValueError("OWNER_ID is required")
         
-        # Setup logging
-        self._setup_logging()
+        self.owner_username = os.getenv('OWNER_USERNAME', '')
         
-        # Initialize database manager
-        self.db = DatabaseManager(self.database_url)
+        self.db = Database()
+        self.setup_database()
         
-        # Risk patterns for detection
-        self.suspicious_keywords = [
-            'http://', 'https://', 't.me/', 'buy now', 'limited offer', 'click here',
-            'earn money', 'make money', 'investment', 'bitcoin', 'crypto', 'free money'
-        ]
-        self.violent_words = [
-            'kill', 'attack', 'bomb', 'violence', 'hurt', 'destroy', 'harm'
-        ]
-        
-        # Track application instance
-        self.application = None
+        logger.info("🤖 Group Protection Bot initialized")
 
-    def _setup_logging(self):
-        """Setup logging for Render environment"""
-        log_level = getattr(logging, self.config['LOG_LEVEL'].upper(), logging.INFO)
-        
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - [Render] - %(message)s',
-            handlers=[logging.StreamHandler(sys.stdout)]
-        )
-        logging.info("🚀 Telegram Group Protection Bot starting...")
-
-    async def initialize_database(self):
-        """Initialize database tables and settings"""
+    def setup_database(self):
+        """Initialize database tables"""
         try:
-            logging.info("🔄 Initializing database...")
-            
-            # Create tables if they don't exist
-            tables_sql = [
-                """
+            # Groups table
+            self.db.execute_query("""
                 CREATE TABLE IF NOT EXISTS groups (
                     id SERIAL PRIMARY KEY,
                     group_id BIGINT UNIQUE NOT NULL,
@@ -235,58 +114,36 @@ class TelegramGroupProtectionBot:
                     last_scan TIMESTAMP,
                     is_active BOOLEAN DEFAULT TRUE
                 )
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS activities (
-                    id SERIAL PRIMARY KEY,
-                    group_id BIGINT NOT NULL,
-                    user_id BIGINT,
-                    activity_type VARCHAR(50) NOT NULL,
-                    content TEXT,
-                    risk_level VARCHAR(20) DEFAULT 'normal',
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """,
-                """
+            """)
+            
+            # Alerts table
+            self.db.execute_query("""
                 CREATE TABLE IF NOT EXISTS alerts (
                     id SERIAL PRIMARY KEY,
                     group_id BIGINT NOT NULL,
                     alert_type VARCHAR(50) NOT NULL,
                     alert_message TEXT NOT NULL,
                     risk_level VARCHAR(20) NOT NULL,
-                    resolved BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS bot_settings (
+            """)
+            
+            # Activities table
+            self.db.execute_query("""
+                CREATE TABLE IF NOT EXISTS activities (
                     id SERIAL PRIMARY KEY,
-                    owner_id BIGINT NOT NULL UNIQUE,
-                    owner_username TEXT,
-                    alert_enabled BOOLEAN DEFAULT TRUE
+                    group_id BIGINT NOT NULL,
+                    user_id BIGINT,
+                    activity_type VARCHAR(50) NOT NULL,
+                    content TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-                """
-            ]
+            """)
             
-            for sql in tables_sql:
-                await self.db.execute_query(sql)
+            logger.info("✅ Database tables initialized")
             
-            # Check if settings exist
-            settings = await self.db.execute_query(
-                "SELECT COUNT(*) as count FROM bot_settings"
-            )
-            
-            if not settings or settings[0]['count'] == 0:
-                await self.db.execute_query(
-                    "INSERT INTO bot_settings (owner_id, owner_username) VALUES (%s, %s)",
-                    (self.owner_id, self.owner_username)
-                )
-                logging.info("✅ Bot settings initialized in database")
-            else:
-                logging.info("✅ Bot settings already exist in database")
-                
         except Exception as e:
-            logging.error(f"❌ Database initialization error: {e}")
+            logger.error(f"Database setup error: {e}")
             raise
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -295,69 +152,57 @@ class TelegramGroupProtectionBot:
             user = update.effective_user
             
             if update.message.chat.type == ChatType.PRIVATE:
-                welcome_text = (
+                await update.message.reply_text(
                     "🤖 **Group Protection Bot**\n\n"
-                    "I'm here to protect your Telegram groups and channels from risks and violations.\n\n"
+                    "I help protect your Telegram groups from risks and violations.\n\n"
                     "**Commands:**\n"
                     "/start - Show this message\n"
-                    "/scan - Perform live scan of the group\n"
+                    "/scan - Scan group for risks\n"
                     "/status - Check group status\n"
-                    "/groups - List all monitored groups\n"
-                    "/alerts - Show recent alerts\n\n"
-                    "Add me to your group/channel and make me admin to start protection!"
+                    "/groups - List monitored groups\n\n"
+                    "Add me to your group and make me admin!",
+                    parse_mode='Markdown'
                 )
-                await update.message.reply_text(welcome_text, parse_mode='Markdown')
                 
-                # Notify owner about new user (if not owner)
                 if user.id != self.owner_id:
-                    await self.send_alert_to_owner(
-                        f"🆕 New user started the bot:\n"
-                        f"User: {user.first_name} (@{user.username or 'No username'})\n"
-                        f"ID: {user.id}"
+                    await self.send_to_owner(
+                        f"🆕 New user: {user.first_name} (@{user.username or 'No username'})"
                     )
-                else:
-                    logging.info("Owner started the bot")
                     
         except Exception as e:
-            logging.error(f"Error in start command: {e}")
+            logger.error(f"Start command error: {e}")
 
-    async def track_new_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Track when bot is added to a new group/channel"""
+    async def handle_chat_member_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle bot being added to groups"""
         try:
             if not update.my_chat_member:
                 return
                 
-            chat_member_update: ChatMemberUpdated = update.my_chat_member
-            chat = chat_member_update.chat
-            old_status = chat_member_update.old_chat_member.status
-            new_status = chat_member_update.new_chat_member.status
+            chat_member = update.my_chat_member
+            chat = chat_member.chat
+            new_status = chat_member.new_chat_member.status
             
-            # Bot was added to group/channel
-            if (old_status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED] and 
-                new_status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR]):
+            # Bot added to group
+            if new_status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR]:
+                await self.add_group(chat)
+                await self.send_to_owner(f"✅ Added to: {chat.title}")
                 
-                logging.info(f"Bot added to {chat.type}: {chat.title}")
-                await self.add_group_to_database(chat)
-                await self.send_group_added_alert(chat)
-                
-                # Send welcome message to group
-                welcome_text = (
-                    "🛡️ **Group Protection Activated!**\n\n"
-                    "I will monitor this group for potential risks and violations.\n"
-                    "Use /scan to perform a security scan.\n"
-                    "Group owner will receive alerts about suspicious activities."
+                # Welcome message
+                await context.bot.send_message(
+                    chat.id,
+                    "🛡️ **Group Protection Activated!**\nUse /scan to check security.",
+                    parse_mode='Markdown'
                 )
-                await context.bot.send_message(chat.id, welcome_text, parse_mode='Markdown')
                 
         except Exception as e:
-            logging.error(f"Error tracking new chat: {e}")
+            logger.error(f"Chat member update error: {e}")
 
-    async def add_group_to_database(self, chat: Chat):
+    async def add_group(self, chat: Chat):
         """Add group to database"""
         try:
-            member_count = await self.get_chat_member_count(chat)
+            member_count = await self.get_member_count(chat)
             
-            await self.db.execute_query("""
+            self.db.execute_query("""
                 INSERT INTO groups (group_id, group_name, group_type, member_count)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (group_id) DO UPDATE SET
@@ -366,339 +211,174 @@ class TelegramGroupProtectionBot:
                 is_active = TRUE
             """, (chat.id, chat.title, chat.type, member_count))
             
-            logging.info(f"✅ Added/updated group in database: {chat.title}")
+            logger.info(f"Group added: {chat.title}")
             
         except Exception as e:
-            logging.error(f"Error adding group to database: {e}")
+            logger.error(f"Add group error: {e}")
 
-    async def get_chat_member_count(self, chat: Chat) -> int:
-        """Safely get chat member count"""
+    async def get_member_count(self, chat: Chat) -> int:
+        """Safely get member count"""
         try:
             return await chat.get_member_count()
-        except (TelegramError, BadRequest) as e:
-            logging.warning(f"Could not get member count for {chat.id}: {e}")
+        except TelegramError:
             return 0
 
-    async def send_group_added_alert(self, chat: Chat):
-        """Send alert to owner when bot is added to a new group"""
-        try:
-            member_count = await self.get_chat_member_count(chat)
-            alert_message = (
-                f"✅ **Bot Added to New {chat.type.capitalize()}**\n\n"
-                f"**Name:** {chat.title}\n"
-                f"**ID:** `{chat.id}`\n"
-                f"**Type:** {chat.type}\n"
-                f"**Members:** {member_count}\n\n"
-                f"Protection monitoring has been activated!"
-            )
-            await self.send_alert_to_owner(alert_message)
-        except Exception as e:
-            logging.error(f"Error sending group added alert: {e}")
-
     async def scan_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Perform live scan of the group"""
+        """Scan group for security risks"""
         try:
             chat = update.effective_chat
             
             if chat.type == ChatType.PRIVATE:
-                await update.message.reply_text("This command can only be used in groups/channels.")
+                await update.message.reply_text("Use this in a group!")
                 return
 
-            # Send scanning message
-            scan_message = await update.message.reply_text("🔍 **Scanning group for risks...**")
+            scan_msg = await update.message.reply_text("🔍 Scanning...")
             
-            # Perform security checks
-            risk_factors = await self.perform_security_scan(chat, context)
+            # Basic security check
+            risk_score = await self.perform_scan(chat, context)
+            status = await self.determine_status(risk_score)
             
-            # Update group status in database
-            await self.update_group_status(chat, risk_factors)
-            
-            # Generate scan report
-            report = await self.generate_scan_report(chat, risk_factors)
-            
-            # Update the scanning message with results
-            await scan_message.edit_text(report, parse_mode='Markdown')
-            
-            # Send detailed report to owner
-            await self.send_detailed_report_to_owner(chat, risk_factors)
-            
-            logging.info(f"✅ Security scan completed for {chat.title}")
-            
-        except Exception as e:
-            logging.error(f"Scan error: {e}")
-            error_msg = "❌ Error during scan. Please make sure I'm an admin with necessary permissions."
-            if update.message:
-                await update.message.reply_text(error_msg)
-
-    async def perform_security_scan(self, chat: Chat, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-        """Perform comprehensive security scan"""
-        risk_factors = {
-            'suspicious_members': [],
-            'recent_joins': 0,
-            'bot_count': 0,
-            'admin_issues': 0,
-            'recent_alerts': 0,
-            'member_count': 0,
-            'risk_score': 0
-        }
-        
-        try:
-            # Get basic chat information
-            risk_factors['member_count'] = await self.get_chat_member_count(chat)
-            
-            # Get recent members (limited for performance)
-            try:
-                async for member in chat.get_members(limit=30):
-                    user = member.user
-                    
-                    # Check for suspicious members
-                    if await self.is_suspicious_member(member):
-                        risk_factors['suspicious_members'].append({
-                            'id': user.id,
-                            'username': user.username,
-                            'first_name': user.first_name
-                        })
-                    
-                    # Count bots
-                    if user.is_bot:
-                        risk_factors['bot_count'] += 1
-                    
-            except (TelegramError, BadRequest) as e:
-                logging.warning(f"Could not scan members for {chat.id}: {e}")
-                risk_factors['admin_issues'] += 1
-            
-            # Check admin permissions
-            risk_factors['admin_issues'] = await self.check_admin_permissions(chat, context)
-            
-            # Get recent alerts from database
-            risk_factors['recent_alerts'] = await self.get_recent_alerts_count(chat.id)
-            
-            # Calculate risk score
-            risk_factors['risk_score'] = self.calculate_risk_score(risk_factors)
-            
-        except Exception as e:
-            logging.error(f"Security scan error for chat {chat.id}: {e}")
-        
-        return risk_factors
-
-    async def is_suspicious_member(self, member: ChatMember) -> bool:
-        """Check if a member is suspicious"""
-        try:
-            user = member.user
-            
-            # No username
-            if not user.username:
-                return True
-            
-            # Suspicious username patterns
-            suspicious_patterns = ['spam', 'bot', 'fake', 'clone']
-            username = user.username.lower()
-            if any(pattern in username for pattern in suspicious_patterns):
-                return True
-            
-            return False
-        except Exception as e:
-            logging.error(f"Error checking suspicious member: {e}")
-            return False
-
-    async def check_admin_permissions(self, chat: Chat, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Check for admin permission issues"""
-        issues = 0
-        try:
-            bot_member = await chat.get_member(context.bot.id)
-            
-            # Check if bot has necessary admin permissions
-            if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
-                issues += 1
-                
-        except (TelegramError, BadRequest) as e:
-            logging.warning(f"Could not check admin permissions for {chat.id}: {e}")
-            issues += 1
-        
-        return issues
-
-    async def get_recent_alerts_count(self, group_id: int) -> int:
-        """Get count of recent alerts for the group"""
-        try:
-            result = await self.db.execute_query(
-                "SELECT COUNT(*) as count FROM alerts WHERE group_id = %s AND created_at > NOW() - INTERVAL '24 hours'",
-                (group_id,)
-            )
-            return result[0]['count'] if result else 0
-        except Exception as e:
-            logging.error(f"Error getting recent alerts count: {e}")
-            return 0
-
-    def calculate_risk_score(self, risk_factors: Dict) -> int:
-        """Calculate overall risk score (0-100)"""
-        score = 0
-        
-        try:
-            # Suspicious members weight
-            score += len(risk_factors['suspicious_members']) * 10
-            
-            # Bot count weight
-            if risk_factors['bot_count'] > 5:
-                score += 15
-            
-            # Admin issues weight
-            score += risk_factors['admin_issues'] * 10
-            
-            # Recent alerts weight
-            score += risk_factors['recent_alerts'] * 3
-            
-            return min(score, 100)
-        except Exception as e:
-            logging.error(f"Error calculating risk score: {e}")
-            return 50
-
-    async def update_group_status(self, chat: Chat, risk_factors: Dict):
-        """Update group status in database"""
-        try:
-            status = 'safe'
-            if risk_factors['risk_score'] > 70:
-                status = 'risk'
-            elif risk_factors['risk_score'] > 30:
-                status = 'warning'
-            
-            await self.db.execute_query("""
+            # Update database
+            self.db.execute_query("""
                 UPDATE groups 
-                SET status = %s, last_scan = NOW(), member_count = %s
+                SET status = %s, last_scan = NOW() 
                 WHERE group_id = %s
-            """, (status, risk_factors['member_count'], chat.id))
+            """, (status, chat.id))
             
-        except Exception as e:
-            logging.error(f"Error updating group status: {e}")
-
-    async def generate_scan_report(self, chat: Chat, risk_factors: Dict) -> str:
-        """Generate scan report for the group"""
-        try:
-            status = '🟢 SAFE'
-            if risk_factors['risk_score'] > 70:
-                status = '🔴 HIGH RISK'
-            elif risk_factors['risk_score'] > 30:
-                status = '🟡 WARNING'
+            # Send report
+            report = self.generate_report(chat, risk_score, status)
+            await scan_msg.edit_text(report, parse_mode='Markdown')
             
-            report = (
-                f"🛡️ **Security Scan Report**\n\n"
-                f"**Group:** {chat.title}\n"
-                f"**Status:** {status}\n"
-                f"**Risk Score:** {risk_factors['risk_score']}/100\n\n"
-                f"**Findings:**\n"
-                f"• Members: {risk_factors['member_count']}\n"
-                f"• Suspicious members: {len(risk_factors['suspicious_members'])}\n"
-                f"• Bots detected: {risk_factors['bot_count']}\n"
-                f"• Permission issues: {risk_factors['admin_issues']}\n"
-                f"• Recent alerts: {risk_factors['recent_alerts']}\n\n"
+            # Notify owner
+            await self.send_to_owner(
+                f"📊 Scan completed for {chat.title}\n"
+                f"Status: {status.upper()}\n"
+                f"Score: {risk_score}/100"
             )
             
-            if risk_factors['risk_score'] > 30:
-                report += "⚠️ **Recommendations:**\n"
-                if len(risk_factors['suspicious_members']) > 0:
-                    report += "• Review suspicious members\n"
-                if risk_factors['bot_count'] > 5:
-                    report += "• Limit bot access\n"
-                if risk_factors['admin_issues'] > 0:
-                    report += "• Check bot admin permissions\n"
-            
-            return report
         except Exception as e:
-            logging.error(f"Error generating scan report: {e}")
-            return "❌ Error generating scan report. Please try again."
+            logger.error(f"Scan error: {e}")
+            await update.message.reply_text("❌ Scan failed!")
 
-    async def send_detailed_report_to_owner(self, chat: Chat, risk_factors: Dict):
-        """Send detailed report to owner"""
+    async def perform_scan(self, chat: Chat, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Perform security scan"""
+        risk_score = 0
+        
         try:
-            detailed_report = (
-                f"📊 **Detailed Scan Report**\n\n"
-                f"**Group:** {chat.title}\n"
-                f"**ID:** `{chat.id}`\n"
-                f"**Risk Score:** {risk_factors['risk_score']}/100\n\n"
-                f"**Analysis:**\n"
-                f"• Total members: {risk_factors['member_count']}\n"
-                f"• Suspicious members: {len(risk_factors['suspicious_members'])}\n"
-                f"• Active bots: {risk_factors['bot_count']}\n"
-                f"• Permission issues: {risk_factors['admin_issues']}\n"
-                f"• Alerts in 24h: {risk_factors['recent_alerts']}\n"
-            )
+            # Check bot permissions
+            try:
+                bot_member = await chat.get_member(context.bot.id)
+                if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
+                    risk_score += 30
+            except TelegramError:
+                risk_score += 50
             
-            await self.send_alert_to_owner(detailed_report)
+            # Check member count (basic risk assessment)
+            member_count = await self.get_member_count(chat)
+            if member_count > 1000:
+                risk_score += 20
+            elif member_count > 100:
+                risk_score += 10
+                
+            # Check recent alerts
+            recent_alerts = self.db.execute_query(
+                "SELECT COUNT(*) as count FROM alerts WHERE group_id = %s AND created_at > NOW() - INTERVAL '1 day'",
+                (chat.id,)
+            )
+            if recent_alerts and recent_alerts[0]['count'] > 5:
+                risk_score += 25
+                
         except Exception as e:
-            logging.error(f"Error sending detailed report: {e}")
+            logger.error(f"Scan performance error: {e}")
+            
+        return min(risk_score, 100)
+
+    async def determine_status(self, risk_score: int) -> str:
+        """Determine group status based on risk score"""
+        if risk_score > 70:
+            return "high_risk"
+        elif risk_score > 30:
+            return "warning"
+        else:
+            return "safe"
+
+    def generate_report(self, chat: Chat, risk_score: int, status: str) -> str:
+        """Generate scan report"""
+        status_emoji = "🔴" if status == "high_risk" else "🟡" if status == "warning" else "🟢"
+        
+        return (
+            f"🛡️ **Security Report**\n\n"
+            f"**Group:** {chat.title}\n"
+            f"**Status:** {status_emoji} {status.upper()}\n"
+            f"**Risk Score:** {risk_score}/100\n\n"
+            f"*Use /status for updates*"
+        )
 
     async def list_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """List all monitored groups"""
         try:
             if update.effective_user.id != self.owner_id:
-                await update.message.reply_text("❌ This command is only available for the bot owner.")
+                await update.message.reply_text("❌ Owner only!")
                 return
             
-            groups = await self.db.execute_query("""
-                SELECT group_id, group_name, group_type, member_count, status, last_scan
-                FROM groups WHERE is_active = TRUE ORDER BY created_at DESC
+            groups = self.db.execute_query("""
+                SELECT group_name, member_count, status, last_scan 
+                FROM groups WHERE is_active = TRUE
             """)
             
             if not groups:
-                await update.message.reply_text("No groups are being monitored yet.")
+                await update.message.reply_text("No groups monitored.")
                 return
             
             response = "📋 **Monitored Groups**\n\n"
-            total_members = 0
-            
             for group in groups:
-                status_icon = "🟢" if group['status'] == 'safe' else "🟡" if group['status'] == 'warning' else "🔴"
-                last_scan = group['last_scan'].strftime("%Y-%m-%d %H:%M") if group['last_scan'] else "Never"
+                status_emoji = "🔴" if group['status'] == 'high_risk' else "🟡" if group['status'] == 'warning' else "🟢"
+                last_scan = group['last_scan'].strftime("%m/%d %H:%M") if group['last_scan'] else "Never"
                 
                 response += (
-                    f"{status_icon} **{group['group_name']}**\n"
-                    f"Type: {group['group_type']} | Members: {group['member_count']}\n"
-                    f"Status: {group['status'].upper()} | Last Scan: {last_scan}\n\n"
+                    f"{status_emoji} **{group['group_name']}**\n"
+                    f"Members: {group['member_count']} | Status: {group['status']}\n"
+                    f"Last Scan: {last_scan}\n\n"
                 )
-                total_members += group['member_count']
-            
-            response += f"**Total:** {len(groups)} groups, {total_members} members"
             
             await update.message.reply_text(response, parse_mode='Markdown')
             
         except Exception as e:
-            logging.error(f"Error listing groups: {e}")
-            await update.message.reply_text("❌ Error retrieving group list.")
+            logger.error(f"List groups error: {e}")
 
-    async def show_alerts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show recent alerts"""
+    async def group_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check group status"""
         try:
-            if update.effective_user.id != self.owner_id:
-                await update.message.reply_text("❌ This command is only available for the bot owner.")
+            chat = update.effective_chat
+            
+            if chat.type == ChatType.PRIVATE:
+                await update.message.reply_text("Use in a group!")
                 return
             
-            alerts = await self.db.execute_query("""
-                SELECT a.*, g.group_name 
-                FROM alerts a 
-                JOIN groups g ON a.group_id = g.group_id 
-                WHERE a.resolved = FALSE
-                ORDER BY a.created_at DESC 
-                LIMIT 5
-            """)
+            group_data = self.db.execute_query(
+                "SELECT status, member_count, last_scan FROM groups WHERE group_id = %s",
+                (chat.id,)
+            )
             
-            if not alerts:
-                await update.message.reply_text("No recent alerts.")
+            if not group_data:
+                await update.message.reply_text("Group not monitored. Use /scan first.")
                 return
             
-            response = "🚨 **Recent Alerts**\n\n"
+            group = group_data[0]
+            status_emoji = "🔴" if group['status'] == 'high_risk' else "🟡" if group['status'] == 'warning' else "🟢"
+            last_scan = group['last_scan'].strftime("%Y-%m-%d %H:%M") if group['last_scan'] else "Never"
             
-            for alert in alerts:
-                risk_icon = "🔴" if alert['risk_level'] == 'high' else "🟡"
-                response += (
-                    f"{risk_icon} **{alert['group_name']}**\n"
-                    f"Type: {alert['alert_type']}\n"
-                    f"Message: {alert['alert_message'][:100]}...\n\n"
-                )
-            
-            await update.message.reply_text(response, parse_mode='Markdown')
+            await update.message.reply_text(
+                f"{status_emoji} **Status for {chat.title}**\n\n"
+                f"**Status:** {group['status'].upper()}\n"
+                f"**Members:** {group['member_count']}\n"
+                f"**Last Scan:** {last_scan}\n\n"
+                f"Use /scan for detailed analysis",
+                parse_mode='Markdown'
+            )
             
         except Exception as e:
-            logging.error(f"Error showing alerts: {e}")
-            await update.message.reply_text("❌ Error retrieving alerts.")
+            logger.error(f"Status error: {e}")
 
     async def monitor_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Monitor messages for suspicious content"""
@@ -710,194 +390,138 @@ class TelegramGroupProtectionBot:
             chat = message.chat
             user = message.from_user
             
-            # Skip if user is bot itself
-            if user and user.id == context.bot.id:
+            if user.id == context.bot.id:
                 return
             
-            # Check for suspicious content
+            # Basic spam detection
             if message.text:
-                suspicious_patterns = []
                 text = message.text.lower()
+                spam_keywords = ['http://', 'https://', 't.me/', 'buy now', 'click here']
                 
-                # Spam patterns
-                if any(keyword in text for keyword in self.suspicious_keywords):
-                    suspicious_patterns.append('spam_links')
-                
-                # Violent content
-                if any(word in text for word in self.violent_words):
-                    suspicious_patterns.append('violent_content')
-                
-                if suspicious_patterns:
-                    await self.log_suspicious_activity(chat, user, message, suspicious_patterns)
-                    
-                    # Send alert to owner
-                    alert_msg = (
-                        f"🚨 **Suspicious Activity**\n\n"
-                        f"**Group:** {chat.title}\n"
-                        f"**User:** @{user.username or 'No username'}\n"
-                        f"**Patterns:** {', '.join(suspicious_patterns)}\n"
-                        f"**Time:** {datetime.now().strftime('%H:%M')}"
+                if any(keyword in text for keyword in spam_keywords):
+                    await self.log_alert(chat, user, "spam_detected")
+                    await self.send_to_owner(
+                        f"🚨 Spam detected in {chat.title}\n"
+                        f"From: @{user.username or 'No username'}\n"
+                        f"Message: {text[:100]}..."
                     )
-                    await self.send_alert_to_owner(alert_msg)
-                
+                    
         except Exception as e:
-            logging.error(f"Error monitoring message: {e}")
+            logger.error(f"Message monitoring error: {e}")
 
-    async def log_suspicious_activity(self, chat: Chat, user: User, message, patterns: List[str]):
-        """Log suspicious activity to database"""
+    async def log_alert(self, chat: Chat, user: User, alert_type: str):
+        """Log alert to database"""
         try:
-            content = message.text[:500] if message.text else 'Media message'
-            
-            # Log activity
-            await self.db.execute_query("""
-                INSERT INTO activities (group_id, user_id, activity_type, content, risk_level)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (chat.id, user.id, 'suspicious_message', content, 'suspicious'))
-            
-            # Create alert
-            await self.db.execute_query("""
+            self.db.execute_query("""
                 INSERT INTO alerts (group_id, alert_type, alert_message, risk_level)
                 VALUES (%s, %s, %s, %s)
-            """, (chat.id, 'suspicious_message', 
-                  f"Suspicious message from @{user.username or 'No username'}", 
-                  'medium'))
+            """, (chat.id, alert_type, f"Alert from @{user.username}", "medium"))
+            
+            # Also log activity
+            self.db.execute_query("""
+                INSERT INTO activities (group_id, user_id, activity_type, content)
+                VALUES (%s, %s, %s, %s)
+            """, (chat.id, user.id, alert_type, "Suspicious activity detected"))
             
         except Exception as e:
-            logging.error(f"Error logging activity: {e}")
+            logger.error(f"Alert logging error: {e}")
 
-    async def send_alert_to_owner(self, message: str):
-        """Send alert message to owner"""
+    async def send_to_owner(self, message: str):
+        """Send message to bot owner"""
         try:
-            if self.application:
-                await self.application.bot.send_message(
-                    chat_id=self.owner_id,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-        except Exception as e:
-            logging.error(f"Error sending alert to owner: {e}")
-
-    async def get_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check current group status"""
-        try:
-            chat = update.effective_chat
-            
-            if chat.type == ChatType.PRIVATE:
-                await update.message.reply_text("This command can only be used in groups/channels.")
-                return
-            
-            group_data = await self.db.execute_query(
-                "SELECT status, last_scan, member_count FROM groups WHERE group_id = %s",
-                (chat.id,)
+            app = Application.builder().token(self.token).build()
+            await app.bot.send_message(
+                chat_id=self.owner_id,
+                text=message,
+                parse_mode='Markdown'
             )
-            
-            if not group_data:
-                await update.message.reply_text("Group not monitored. Use /scan to start monitoring.")
-                return
-            
-            group = group_data[0]
-            status_icon = "🟢" if group['status'] == 'safe' else "🟡" if group['status'] == 'warning' else "🔴"
-            last_scan = group['last_scan'].strftime("%Y-%m-%d %H:%M") if group['last_scan'] else "Never"
-            
-            status_msg = (
-                f"{status_icon} **Group Status**\n\n"
-                f"**Name:** {chat.title}\n"
-                f"**Status:** {group['status'].upper()}\n"
-                f"**Members:** {group['member_count']}\n"
-                f"**Last Scan:** {last_scan}\n\n"
-                f"Use /scan for detailed security check."
-            )
-            
-            await update.message.reply_text(status_msg, parse_mode='Markdown')
-            
+            await app.shutdown()
         except Exception as e:
-            logging.error(f"Error getting status: {e}")
-            await update.message.reply_text("❌ Error retrieving status.")
+            logger.error(f"Send to owner error: {e}")
 
     def setup_handlers(self, application: Application):
         """Setup bot handlers"""
         # Command handlers
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("scan", self.scan_group))
-        application.add_handler(CommandHandler("status", self.get_status))
+        application.add_handler(CommandHandler("status", self.group_status))
         application.add_handler(CommandHandler("groups", self.list_groups))
-        application.add_handler(CommandHandler("alerts", self.show_alerts))
         
-        # Track when bot is added to groups
-        application.add_handler(ChatMemberHandler(self.track_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
+        # Chat member updates
+        application.add_handler(ChatMemberHandler(
+            self.handle_chat_member_update, 
+            ChatMemberHandler.MY_CHAT_MEMBER
+        ))
         
-        # Monitor messages
+        # Message monitoring
         application.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
             self.monitor_messages
         ))
 
-    async def setup_bot_commands(self, application: Application):
-        """Setup bot commands menu"""
-        try:
-            commands = [
-                BotCommand("start", "Start the bot"),
-                BotCommand("scan", "Scan group for risks"),
-                BotCommand("status", "Check group status"),
-                BotCommand("groups", "List monitored groups"),
-                BotCommand("alerts", "Show recent alerts"),
-            ]
-            await application.bot.set_my_commands(commands)
-        except Exception as e:
-            logging.error(f"Error setting up bot commands: {e}")
+    async def setup_commands(self, application: Application):
+        """Setup bot commands"""
+        commands = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("scan", "Scan group for risks"),
+            BotCommand("status", "Check group status"),
+            BotCommand("groups", "List monitored groups"),
+        ]
+        await application.bot.set_my_commands(commands)
 
     async def error_handler(self, update: Update, context: CallbackContext):
-        """Handle errors in telegram bot"""
+        """Handle errors"""
         try:
-            logging.error(f"Exception while handling an update: {context.error}")
+            logger.error(f"Update {update} caused error {context.error}")
         except Exception as e:
-            logging.error(f"Error in error handler: {e}")
+            logger.error(f"Error handler error: {e}")
 
     async def run(self):
         """Run the bot"""
         try:
-            logging.info("🚀 Starting Telegram Bot...")
-            
             # Create application
-            self.application = Application.builder().token(self.bot_token).build()
-            
-            # Initialize database
-            await self.initialize_database()
+            application = Application.builder().token(self.token).build()
             
             # Setup handlers
-            self.setup_handlers(self.application)
+            self.setup_handlers(application)
             
-            # Setup bot commands
-            await self.setup_bot_commands(self.application)
+            # Setup commands
+            await self.setup_commands(application)
             
             # Add error handler
-            self.application.add_error_handler(self.error_handler)
+            application.add_error_handler(self.error_handler)
             
-            # Send startup notification
-            await self.send_alert_to_owner("🤖 **Bot Started Successfully**\n\nThe group protection bot is now running and ready!")
+            # Notify owner
+            await self.send_to_owner("🤖 **Bot Started Successfully**\n\nGroup protection bot is now running!")
             
-            logging.info("✅ Bot started successfully - now polling for updates...")
+            logger.info("✅ Bot started - polling for updates...")
             
             # Start polling
-            await self.application.run_polling(
-                allowed_updates=["message", "edited_message", "my_chat_member"],
-                drop_pending_updates=True
+            await application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=["message", "my_chat_member", "chat_member"]
             )
             
         except Exception as e:
-            logging.critical(f"❌ Fatal error starting bot: {e}")
+            logger.critical(f"❌ Bot failed to start: {e}")
             raise
 
-# Main execution
-if __name__ == '__main__':
-    # Add startup delay for Render
-    time.sleep(2)
-    
+def main():
+    """Main function with proper error handling"""
     try:
-        bot = TelegramGroupProtectionBot()
+        logger.info("🚀 Starting Group Protection Bot...")
+        
+        # Create and run bot
+        bot = GroupProtectionBot()
+        
+        # Run the bot
         asyncio.run(bot.run())
+        
     except KeyboardInterrupt:
-        logging.info("Bot stopped by user")
+        logger.info("Bot stopped by user")
     except Exception as e:
-        logging.critical(f"Fatal error: {e}")
+        logger.critical(f"Fatal error: {e}")
         sys.exit(1)
+
+if __name__ == '__main__':
+    main()
