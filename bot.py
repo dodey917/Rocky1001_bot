@@ -2,10 +2,25 @@ import os
 import logging
 import asyncio
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
-import psycopg2
-from psycopg2.extras import RealDictCursor
+
+# Try different PostgreSQL drivers
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRES_DRIVER = "psycopg2"
+except ImportError as e:
+    try:
+        import pg8000
+        from pg8000 import Connection
+        POSTGRES_DRIVER = "pg8000"
+        logging.info("Using pg8000 as PostgreSQL driver")
+    except ImportError:
+        logging.error("No PostgreSQL driver available. Install psycopg2 or pg8000")
+        sys.exit(1)
+
 from dotenv import load_dotenv
 from telegram import (
     Update, 
@@ -27,11 +42,11 @@ from telegram.ext import (
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import TelegramError, BadRequest
 
-# Try to load .env file (for local development, ignored on Render)
+# Try to load .env file (for local development)
 try:
     load_dotenv()
-except Exception as e:
-    print(f"Note: .env file not loaded (normal on Render): {e}")
+except Exception:
+    pass  # Ignore if no .env file (normal on Render)
 
 class Config:
     """Configuration management with Render environment support"""
@@ -43,12 +58,7 @@ class Config:
         if not value:
             raise ValueError(
                 f"❌ Required environment variable '{var_name}' is not set.\n"
-                f"Please set it in your Render environment variables:\n"
-                f"1. Go to your Render dashboard\n"
-                f"2. Select your service\n" 
-                f"3. Click 'Environment' tab\n"
-                f"4. Add '{var_name}' with your value\n"
-                f"5. Redeploy the service"
+                f"Please set it in your Render environment variables."
             )
         return value
 
@@ -64,7 +74,7 @@ class Config:
             'BOT_TOKEN': cls.get_required_env('BOT_TOKEN'),
             'DATABASE_URL': cls.get_required_env('DATABASE_URL'),
             'OWNER_ID': cls.get_optional_env('OWNER_ID'),
-            'OWNER_USERNAME': cls.get_optional_env('OWNER_USERNAME'),
+            'OWNER_USERNAME': cls.get_optional_env('OWNER_USERNAME', ''),
             'LOG_LEVEL': cls.get_optional_env('LOG_LEVEL', 'INFO'),
         }
         
@@ -80,80 +90,79 @@ class Config:
         return config
 
 class DatabaseManager:
-    """Manage database connections and operations with Render compatibility"""
+    """Manage database connections and operations with multiple driver support"""
     
     def __init__(self, database_url: str):
         self.database_url = database_url
-        self._validate_database_url()
-    
-    def _validate_database_url(self):
-        """Validate database URL format"""
-        if not self.database_url.startswith(('postgresql://', 'postgres://')):
-            logging.warning(
-                "Database URL might need adjustment. "
-                "Render typically provides PostgreSQL URLs starting with 'postgresql://'"
-            )
-    
+        self.driver = POSTGRES_DRIVER
+        logging.info(f"Using database driver: {self.driver}")
+
     def get_connection(self):
-        """Get database connection with Render-compatible error handling"""
-        max_retries = 3
-        retry_delay = 2
-        
-        for attempt in range(max_retries):
-            try:
-                # Render's PostgreSQL might need specific connection parameters
-                conn = psycopg2.connect(
+        """Get database connection based on available driver"""
+        try:
+            if self.driver == "psycopg2":
+                return psycopg2.connect(
                     self.database_url,
                     cursor_factory=RealDictCursor,
-                    connect_timeout=10,
-                    keepalives=1,
-                    keepalives_idle=30,
-                    keepalives_interval=10,
-                    keepalives_count=5
+                    connect_timeout=10
                 )
+            elif self.driver == "pg8000":
+                # Parse database URL for pg8000
+                from urllib.parse import urlparse
+                url = urlparse(self.database_url)
                 
-                # Test connection
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT 1")
+                # Extract connection parameters
+                dbname = url.path[1:]  # Remove leading slash
+                user = url.username
+                password = url.password
+                host = url.hostname
+                port = url.port or 5432
                 
-                logging.info("✅ Database connection established successfully")
+                conn = pg8000.connect(
+                    database=dbname,
+                    user=user,
+                    password=password,
+                    host=host,
+                    port=port,
+                    timeout=10
+                )
                 return conn
-                
-            except psycopg2.OperationalError as e:
-                logging.warning(f"Database connection attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    logging.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    raise Exception(f"Failed to connect to database after {max_retries} attempts: {e}")
-            except Exception as e:
-                logging.error(f"Unexpected database connection error: {e}")
-                raise
+        except Exception as e:
+            logging.error(f"Database connection error with {self.driver}: {e}")
+            raise
 
     async def execute_query(self, query: str, params: tuple = None) -> Any:
         """Execute a query with proper error handling"""
         conn = None
         try:
             conn = self.get_connection()
-            with conn.cursor() as cursor:
+            
+            if self.driver == "psycopg2":
+                with conn.cursor() as cursor:
+                    cursor.execute(query, params or ())
+                    if query.strip().upper().startswith('SELECT'):
+                        result = cursor.fetchall()
+                    else:
+                        conn.commit()
+                        result = None
+            
+            elif self.driver == "pg8000":
+                cursor = conn.cursor()
                 cursor.execute(query, params or ())
                 if query.strip().upper().startswith('SELECT'):
-                    result = cursor.fetchall()
+                    result = []
+                    columns = [desc[0] for desc in cursor.description]
+                    for row in cursor.fetchall():
+                        result.append(dict(zip(columns, row)))
                 else:
                     conn.commit()
                     result = None
+                cursor.close()
+            
             return result
-        except psycopg2.InterfaceError as e:
-            logging.error(f"Database interface error: {e}")
-            raise
-        except psycopg2.DatabaseError as e:
-            logging.error(f"Database error: {e}")
-            if conn:
-                conn.rollback()
-            raise
+            
         except Exception as e:
-            logging.error(f"Unexpected error in execute_query: {e}")
+            logging.error(f"Query execution error: {e}")
             if conn:
                 conn.rollback()
             raise
@@ -161,8 +170,8 @@ class DatabaseManager:
             if conn:
                 conn.close()
 
-class RenderCompatibleBot:
-    """Telegram bot optimized for Render deployment"""
+class TelegramGroupProtectionBot:
+    """Telegram bot for group protection optimized for Render"""
     
     def __init__(self):
         # Load configuration with proper error handling
@@ -203,24 +212,71 @@ class RenderCompatibleBot:
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(name)s - %(levelname)s - [Render] - %(message)s',
-            handlers=[
-                logging.StreamHandler(sys.stdout)  # Render captures stdout
-            ]
+            handlers=[logging.StreamHandler(sys.stdout)]
         )
-        logging.info("🚀 Render-compatible Telegram Bot starting...")
-        logging.info(f"Owner ID: {self.owner_id}, Username: {self.owner_username}")
+        logging.info("🚀 Telegram Group Protection Bot starting...")
 
     async def initialize_database(self):
-        """Initialize database tables and settings for Render"""
+        """Initialize database tables and settings"""
         try:
             logging.info("🔄 Initializing database...")
+            
+            # Create tables if they don't exist
+            tables_sql = [
+                """
+                CREATE TABLE IF NOT EXISTS groups (
+                    id SERIAL PRIMARY KEY,
+                    group_id BIGINT UNIQUE NOT NULL,
+                    group_name TEXT,
+                    group_type VARCHAR(20),
+                    member_count INTEGER DEFAULT 0,
+                    status VARCHAR(20) DEFAULT 'safe',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_scan TIMESTAMP,
+                    is_active BOOLEAN DEFAULT TRUE
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS activities (
+                    id SERIAL PRIMARY KEY,
+                    group_id BIGINT NOT NULL,
+                    user_id BIGINT,
+                    activity_type VARCHAR(50) NOT NULL,
+                    content TEXT,
+                    risk_level VARCHAR(20) DEFAULT 'normal',
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id SERIAL PRIMARY KEY,
+                    group_id BIGINT NOT NULL,
+                    alert_type VARCHAR(50) NOT NULL,
+                    alert_message TEXT NOT NULL,
+                    risk_level VARCHAR(20) NOT NULL,
+                    resolved BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    id SERIAL PRIMARY KEY,
+                    owner_id BIGINT NOT NULL UNIQUE,
+                    owner_username TEXT,
+                    alert_enabled BOOLEAN DEFAULT TRUE
+                )
+                """
+            ]
+            
+            for sql in tables_sql:
+                await self.db.execute_query(sql)
             
             # Check if settings exist
             settings = await self.db.execute_query(
                 "SELECT COUNT(*) as count FROM bot_settings"
             )
             
-            if settings[0]['count'] == 0:
+            if not settings or settings[0]['count'] == 0:
                 await self.db.execute_query(
                     "INSERT INTO bot_settings (owner_id, owner_username) VALUES (%s, %s)",
                     (self.owner_id, self.owner_username)
@@ -231,7 +287,6 @@ class RenderCompatibleBot:
                 
         except Exception as e:
             logging.error(f"❌ Database initialization error: {e}")
-            await self.send_alert_to_owner(f"Database initialization failed: {e}")
             raise
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,7 +320,6 @@ class RenderCompatibleBot:
                     
         except Exception as e:
             logging.error(f"Error in start command: {e}")
-            await self.send_error_alert(f"Start command error: {e}")
 
     async def track_new_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Track when bot is added to a new group/channel"""
@@ -297,7 +351,6 @@ class RenderCompatibleBot:
                 
         except Exception as e:
             logging.error(f"Error tracking new chat: {e}")
-            await self.send_error_alert(f"New chat tracking error: {e}")
 
     async def add_group_to_database(self, chat: Chat):
         """Add group to database"""
@@ -317,7 +370,6 @@ class RenderCompatibleBot:
             
         except Exception as e:
             logging.error(f"Error adding group to database: {e}")
-            raise
 
     async def get_chat_member_count(self, chat: Chat) -> int:
         """Safely get chat member count"""
@@ -387,8 +439,7 @@ class RenderCompatibleBot:
             'admin_issues': 0,
             'recent_alerts': 0,
             'member_count': 0,
-            'risk_score': 0,
-            'scan_time': datetime.now()
+            'risk_score': 0
         }
         
         try:
@@ -397,9 +448,7 @@ class RenderCompatibleBot:
             
             # Get recent members (limited for performance)
             try:
-                member_count = 0
-                async for member in chat.get_members(limit=50):
-                    member_count += 1
+                async for member in chat.get_members(limit=30):
                     user = member.user
                     
                     # Check for suspicious members
@@ -414,13 +463,6 @@ class RenderCompatibleBot:
                     if user.is_bot:
                         risk_factors['bot_count'] += 1
                     
-                    # Check recent joins (last 24 hours)
-                    if (hasattr(member, 'joined_date') and member.joined_date and 
-                        member.joined_date > datetime.now() - timedelta(hours=24)):
-                        risk_factors['recent_joins'] += 1
-                
-                risk_factors['member_count'] = member_count
-                
             except (TelegramError, BadRequest) as e:
                 logging.warning(f"Could not scan members for {chat.id}: {e}")
                 risk_factors['admin_issues'] += 1
@@ -448,12 +490,8 @@ class RenderCompatibleBot:
             if not user.username:
                 return True
             
-            # New accounts (rough check based on user ID)
-            if user.id > 7000000000:
-                return True
-            
             # Suspicious username patterns
-            suspicious_patterns = ['spam', 'bot', 'fake', 'clone', 'user']
+            suspicious_patterns = ['spam', 'bot', 'fake', 'clone']
             username = user.username.lower()
             if any(pattern in username for pattern in suspicious_patterns):
                 return True
@@ -470,9 +508,7 @@ class RenderCompatibleBot:
             bot_member = await chat.get_member(context.bot.id)
             
             # Check if bot has necessary admin permissions
-            if (bot_member.status != ChatMemberStatus.ADMINISTRATOR or 
-                not bot_member.can_delete_messages or 
-                not bot_member.can_restrict_members):
+            if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
                 issues += 1
                 
         except (TelegramError, BadRequest) as e:
@@ -501,19 +537,9 @@ class RenderCompatibleBot:
             # Suspicious members weight
             score += len(risk_factors['suspicious_members']) * 10
             
-            # High recent joins weight
-            recent_joins = risk_factors['recent_joins']
-            if recent_joins > 20:
-                score += 20
-            elif recent_joins > 10:
-                score += 10
-            
             # Bot count weight
-            bot_count = risk_factors['bot_count']
-            if bot_count > 5:
+            if risk_factors['bot_count'] > 5:
                 score += 15
-            elif bot_count > 2:
-                score += 5
             
             # Admin issues weight
             score += risk_factors['admin_issues'] * 10
@@ -559,9 +585,8 @@ class RenderCompatibleBot:
                 f"**Status:** {status}\n"
                 f"**Risk Score:** {risk_factors['risk_score']}/100\n\n"
                 f"**Findings:**\n"
-                f"• Members scanned: {risk_factors['member_count']}\n"
+                f"• Members: {risk_factors['member_count']}\n"
                 f"• Suspicious members: {len(risk_factors['suspicious_members'])}\n"
-                f"• Recent joins (24h): {risk_factors['recent_joins']}\n"
                 f"• Bots detected: {risk_factors['bot_count']}\n"
                 f"• Permission issues: {risk_factors['admin_issues']}\n"
                 f"• Recent alerts: {risk_factors['recent_alerts']}\n\n"
@@ -571,8 +596,6 @@ class RenderCompatibleBot:
                 report += "⚠️ **Recommendations:**\n"
                 if len(risk_factors['suspicious_members']) > 0:
                     report += "• Review suspicious members\n"
-                if risk_factors['recent_joins'] > 20:
-                    report += "• Consider enabling join approvals\n"
                 if risk_factors['bot_count'] > 5:
                     report += "• Limit bot access\n"
                 if risk_factors['admin_issues'] > 0:
@@ -591,19 +614,13 @@ class RenderCompatibleBot:
                 f"**Group:** {chat.title}\n"
                 f"**ID:** `{chat.id}`\n"
                 f"**Risk Score:** {risk_factors['risk_score']}/100\n\n"
-                f"**Detailed Analysis:**\n"
-                f"• Total members scanned: {risk_factors['member_count']}\n"
-                f"• Suspicious members found: {len(risk_factors['suspicious_members'])}\n"
-                f"• New joins (24h): {risk_factors['recent_joins']}\n"
+                f"**Analysis:**\n"
+                f"• Total members: {risk_factors['member_count']}\n"
+                f"• Suspicious members: {len(risk_factors['suspicious_members'])}\n"
                 f"• Active bots: {risk_factors['bot_count']}\n"
                 f"• Permission issues: {risk_factors['admin_issues']}\n"
-                f"• Alerts in 24h: {risk_factors['recent_alerts']}\n\n"
+                f"• Alerts in 24h: {risk_factors['recent_alerts']}\n"
             )
-            
-            if risk_factors['suspicious_members']:
-                detailed_report += "**Suspicious Members (sample):**\n"
-                for user in risk_factors['suspicious_members'][:3]:
-                    detailed_report += f"• @{user['username'] or 'No username'} (ID: {user['id']})\n"
             
             await self.send_alert_to_owner(detailed_report)
         except Exception as e:
@@ -627,7 +644,6 @@ class RenderCompatibleBot:
             
             response = "📋 **Monitored Groups**\n\n"
             total_members = 0
-            total_groups = len(groups)
             
             for group in groups:
                 status_icon = "🟢" if group['status'] == 'safe' else "🟡" if group['status'] == 'warning' else "🔴"
@@ -636,12 +652,11 @@ class RenderCompatibleBot:
                 response += (
                     f"{status_icon} **{group['group_name']}**\n"
                     f"Type: {group['group_type']} | Members: {group['member_count']}\n"
-                    f"Status: {group['status'].upper()} | Last Scan: {last_scan}\n"
-                    f"ID: `{group['group_id']}`\n\n"
+                    f"Status: {group['status'].upper()} | Last Scan: {last_scan}\n\n"
                 )
                 total_members += group['member_count']
             
-            response += f"**Total:** {total_groups} groups, {total_members} members"
+            response += f"**Total:** {len(groups)} groups, {total_members} members"
             
             await update.message.reply_text(response, parse_mode='Markdown')
             
@@ -662,7 +677,7 @@ class RenderCompatibleBot:
                 JOIN groups g ON a.group_id = g.group_id 
                 WHERE a.resolved = FALSE
                 ORDER BY a.created_at DESC 
-                LIMIT 10
+                LIMIT 5
             """)
             
             if not alerts:
@@ -672,12 +687,11 @@ class RenderCompatibleBot:
             response = "🚨 **Recent Alerts**\n\n"
             
             for alert in alerts:
-                risk_icon = "🔴" if alert['risk_level'] == 'high' else "🟡" if alert['risk_level'] == 'medium' else "🔵"
+                risk_icon = "🔴" if alert['risk_level'] == 'high' else "🟡"
                 response += (
                     f"{risk_icon} **{alert['group_name']}**\n"
                     f"Type: {alert['alert_type']}\n"
-                    f"Message: {alert['alert_message'][:100]}...\n"
-                    f"Time: {alert['created_at'].strftime('%Y-%m-%d %H:%M')}\n\n"
+                    f"Message: {alert['alert_message'][:100]}...\n\n"
                 )
             
             await update.message.reply_text(response, parse_mode='Markdown')
@@ -697,35 +711,12 @@ class RenderCompatibleBot:
             user = message.from_user
             
             # Skip if user is bot itself
-            if user.id == context.bot.id:
+            if user and user.id == context.bot.id:
                 return
             
             # Check for suspicious content
-            suspicious_patterns = await self.detect_suspicious_content(message)
-            
-            if suspicious_patterns:
-                await self.log_suspicious_activity(chat, user, message, suspicious_patterns)
-                
-                # Send immediate alert to owner
-                alert_msg = (
-                    f"🚨 **Suspicious Activity Detected**\n\n"
-                    f"**Group:** {chat.title}\n"
-                    f"**User:** @{user.username or 'No username'} (ID: {user.id})\n"
-                    f"**Content:** {message.text[:100] if message.text else 'Media message'}\n"
-                    f"**Patterns:** {', '.join(suspicious_patterns)}\n"
-                    f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                )
-                await self.send_alert_to_owner(alert_msg)
-                
-        except Exception as e:
-            logging.error(f"Error monitoring message: {e}")
-
-    async def detect_suspicious_content(self, message) -> List[str]:
-        """Detect suspicious content in messages"""
-        suspicious_patterns = []
-        
-        try:
             if message.text:
+                suspicious_patterns = []
                 text = message.text.lower()
                 
                 # Spam patterns
@@ -736,41 +727,40 @@ class RenderCompatibleBot:
                 if any(word in text for word in self.violent_words):
                     suspicious_patterns.append('violent_content')
                 
-                # Too many capital letters (shouting)
-                if len(text) > 10 and sum(1 for c in text if c.isupper()) / len(text) > 0.7:
-                    suspicious_patterns.append('excessive_caps')
+                if suspicious_patterns:
+                    await self.log_suspicious_activity(chat, user, message, suspicious_patterns)
+                    
+                    # Send alert to owner
+                    alert_msg = (
+                        f"🚨 **Suspicious Activity**\n\n"
+                        f"**Group:** {chat.title}\n"
+                        f"**User:** @{user.username or 'No username'}\n"
+                        f"**Patterns:** {', '.join(suspicious_patterns)}\n"
+                        f"**Time:** {datetime.now().strftime('%H:%M')}"
+                    )
+                    await self.send_alert_to_owner(alert_msg)
                 
-                # Repeated messages
-                if len(text) > 50 and len(set(text.split())) < 10:
-                    suspicious_patterns.append('repetitive_content')
-            
         except Exception as e:
-            logging.error(f"Error detecting suspicious content: {e}")
-        
-        return suspicious_patterns
+            logging.error(f"Error monitoring message: {e}")
 
     async def log_suspicious_activity(self, chat: Chat, user: User, message, patterns: List[str]):
         """Log suspicious activity to database"""
         try:
             content = message.text[:500] if message.text else 'Media message'
-            risk_level = 'high_risk' if 'violent_content' in patterns else 'suspicious'
             
             # Log activity
             await self.db.execute_query("""
                 INSERT INTO activities (group_id, user_id, activity_type, content, risk_level)
                 VALUES (%s, %s, %s, %s, %s)
-            """, (chat.id, user.id, 'suspicious_message', content, risk_level))
+            """, (chat.id, user.id, 'suspicious_message', content, 'suspicious'))
             
             # Create alert
-            alert_type = 'violent_content' if 'violent_content' in patterns else 'suspicious_message'
-            alert_risk_level = 'high' if 'violent_content' in patterns else 'medium'
-            
             await self.db.execute_query("""
                 INSERT INTO alerts (group_id, alert_type, alert_message, risk_level)
                 VALUES (%s, %s, %s, %s)
-            """, (chat.id, alert_type, 
-                  f"Suspicious message from @{user.username or 'No username'}: {', '.join(patterns)}", 
-                  alert_risk_level))
+            """, (chat.id, 'suspicious_message', 
+                  f"Suspicious message from @{user.username or 'No username'}", 
+                  'medium'))
             
         except Exception as e:
             logging.error(f"Error logging activity: {e}")
@@ -778,36 +768,14 @@ class RenderCompatibleBot:
     async def send_alert_to_owner(self, message: str):
         """Send alert message to owner"""
         try:
-            if not self.owner_id:
-                logging.warning("Owner ID not set, cannot send alert")
-                return
-                
-            # Use the existing application instance if available
             if self.application:
                 await self.application.bot.send_message(
                     chat_id=self.owner_id,
                     text=message,
                     parse_mode='Markdown'
                 )
-            else:
-                # Fallback: create temporary application
-                app = Application.builder().token(self.bot_token).build()
-                await app.bot.send_message(
-                    chat_id=self.owner_id,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-                await app.shutdown()
-                
         except Exception as e:
             logging.error(f"Error sending alert to owner: {e}")
-
-    async def send_error_alert(self, error_message: str):
-        """Send error alert to owner"""
-        try:
-            await self.send_alert_to_owner(f"❌ **Bot Error**\n\n{error_message}")
-        except Exception as e:
-            logging.error(f"Error sending error alert: {e}")
 
     async def get_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Check current group status"""
@@ -847,7 +815,7 @@ class RenderCompatibleBot:
             await update.message.reply_text("❌ Error retrieving status.")
 
     def setup_handlers(self, application: Application):
-        """Setup bot handlers with error handling"""
+        """Setup bot handlers"""
         # Command handlers
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("scan", self.scan_group))
@@ -858,9 +826,9 @@ class RenderCompatibleBot:
         # Track when bot is added to groups
         application.add_handler(ChatMemberHandler(self.track_new_chat, ChatMemberHandler.MY_CHAT_MEMBER))
         
-        # Monitor messages (exclude commands)
+        # Monitor messages
         application.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS & filters.ChatType.CHANNELS, 
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
             self.monitor_messages
         ))
 
@@ -871,11 +839,10 @@ class RenderCompatibleBot:
                 BotCommand("start", "Start the bot"),
                 BotCommand("scan", "Scan group for risks"),
                 BotCommand("status", "Check group status"),
-                BotCommand("groups", "List monitored groups (owner only)"),
-                BotCommand("alerts", "Show recent alerts (owner only)"),
+                BotCommand("groups", "List monitored groups"),
+                BotCommand("alerts", "Show recent alerts"),
             ]
             await application.bot.set_my_commands(commands)
-            logging.info("✅ Bot commands menu setup completed")
         except Exception as e:
             logging.error(f"Error setting up bot commands: {e}")
 
@@ -883,48 +850,16 @@ class RenderCompatibleBot:
         """Handle errors in telegram bot"""
         try:
             logging.error(f"Exception while handling an update: {context.error}")
-            
-            # Send error alert to owner
-            error_msg = f"Bot Error: {context.error}"
-            await self.send_error_alert(error_msg)
         except Exception as e:
             logging.error(f"Error in error handler: {e}")
 
-    async def health_check(self):
-        """Perform health check - useful for Render monitoring"""
-        try:
-            # Test database connection
-            await self.db.execute_query("SELECT 1")
-            
-            # Test bot token
-            app = Application.builder().token(self.bot_token).build()
-            bot_info = await app.bot.get_me()
-            
-            logging.info(f"✅ Health check passed - Bot: {bot_info.username}")
-            return True
-        except Exception as e:
-            logging.error(f"❌ Health check failed: {e}")
-            return False
-
     async def run(self):
-        """Run the bot with Render-optimized configuration"""
+        """Run the bot"""
         try:
-            logging.info("🚀 Starting Render-compatible Telegram Bot...")
+            logging.info("🚀 Starting Telegram Bot...")
             
-            # Perform health check
-            if not await self.health_check():
-                raise Exception("Health check failed - check environment variables")
-            
-            # Create application with optimized settings for Render
-            self.application = (
-                Application.builder()
-                .token(self.bot_token)
-                .pool_timeout(30)  # Increased for better reliability
-                .connect_timeout(30)  # Increased for better reliability
-                .read_timeout(30)  # Increased for better reliability
-                .write_timeout(30)  # Increased for better reliability
-                .build()
-            )
+            # Create application
+            self.application = Application.builder().token(self.bot_token).build()
             
             # Initialize database
             await self.initialize_database()
@@ -938,53 +873,31 @@ class RenderCompatibleBot:
             # Add error handler
             self.application.add_error_handler(self.error_handler)
             
-            # Send startup notification to owner
-            await self.send_alert_to_owner(
-                "🤖 **Bot Started Successfully on Render**\n\n"
-                "The group protection bot is now running and ready to monitor your groups and channels."
-            )
+            # Send startup notification
+            await self.send_alert_to_owner("🤖 **Bot Started Successfully**\n\nThe group protection bot is now running and ready!")
             
-            logging.info("✅ Bot started successfully and is now polling for updates...")
+            logging.info("✅ Bot started successfully - now polling for updates...")
             
-            # Start polling with Render-optimized settings
+            # Start polling
             await self.application.run_polling(
-                allowed_updates=[
-                    "message", 
-                    "edited_message", 
-                    "my_chat_member", 
-                    "chat_member"
-                ],
-                drop_pending_updates=True,  # Clean start on Render
-                close_loop=False  # Important for Render compatibility
+                allowed_updates=["message", "edited_message", "my_chat_member"],
+                drop_pending_updates=True
             )
             
         except Exception as e:
             logging.critical(f"❌ Fatal error starting bot: {e}")
-            await self.send_error_alert(f"Fatal bot error: {e}")
             raise
 
-# Main execution with comprehensive error handling
+# Main execution
 if __name__ == '__main__':
-    import time
-    
-    # Add startup delay for Render environment stability
+    # Add startup delay for Render
     time.sleep(2)
     
     try:
-        bot = RenderCompatibleBot()
-        
-        # Run the bot with restart capability
-        while True:
-            try:
-                asyncio.run(bot.run())
-            except KeyboardInterrupt:
-                logging.info("Bot stopped by user")
-                break
-            except Exception as e:
-                logging.error(f"Bot crashed: {e}")
-                logging.info("Restarting in 10 seconds...")
-                time.sleep(10)
-                
+        bot = TelegramGroupProtectionBot()
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
     except Exception as e:
         logging.critical(f"Fatal error: {e}")
         sys.exit(1)
