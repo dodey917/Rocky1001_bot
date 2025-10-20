@@ -5,16 +5,25 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import sqlite3
 from datetime import datetime, timedelta
 
-# Setup
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-ALERT_CHAT_ID = os.getenv('ALERT_CHAT_ID')  # Your Telegram ID for ban alerts
+# Render environment variables
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+ALERT_CHAT_ID = os.environ.get('ALERT_CHAT_ID')
 
-logging.basicConfig(level=logging.INFO)
+# Validate required environment variables
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required")
+if not ALERT_CHAT_ID:
+    raise ValueError("ALERT_CHAT_ID environment variable is required")
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Database setup
+# Database setup - Render provides persistent storage
 def init_db():
-    conn = sqlite3.connect('protection_bot.db')
+    conn = sqlite3.connect('/tmp/protection_bot.db')  # Use /tmp for Render compatibility
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -61,6 +70,7 @@ def init_db():
     
     conn.commit()
     conn.close()
+    logger.info("Database initialized successfully")
 
 init_db()
 
@@ -70,7 +80,7 @@ class BanProtection:
             'http://', 'https://', '.com', '.org', '.net', '.xyz',
             'buy now', 'click here', 'limited offer', 'discount',
             'make money', 'earn cash', 'work from home', 'investment',
-            'bitcoin', 'crypto', 'free money'
+            'bitcoin', 'crypto', 'free money', 't.me/joinchat/'
         ]
         
         self.bad_words = [
@@ -81,7 +91,7 @@ class BanProtection:
         self.scam_phrases = [
             'send money', 'bank transfer', 'password', 'login',
             'verify account', 'security check', 'admin contact',
-            'telegram support', 'official group'
+            'telegram support', 'official group', 'card number'
         ]
     
     def check_message_risk(self, text):
@@ -145,7 +155,7 @@ async def send_ban_alert(context, group_title, username, user_id, message_text, 
         )
         
         # Save alert to database
-        conn = sqlite3.connect('protection_bot.db')
+        conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
         cursor.execute(
             'INSERT INTO ban_alerts (group_id, alert_type, alert_message) VALUES (?, ?, ?)',
@@ -153,6 +163,8 @@ async def send_ban_alert(context, group_title, username, user_id, message_text, 
         )
         conn.commit()
         conn.close()
+        
+        logger.info(f"Alert sent for {risk_type} in {group_title}")
         
     except Exception as e:
         logger.error(f"Alert error: {e}")
@@ -179,7 +191,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         # Save group info
-        conn = sqlite3.connect('protection_bot.db')
+        conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
         cursor.execute(
             'INSERT OR REPLACE INTO groups (group_id, group_title) VALUES (?, ?)',
@@ -203,7 +215,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        conn = sqlite3.connect('protection_bot.db')
+        conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
         
         # Get stats for this group
@@ -224,7 +236,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_member = await update.effective_chat.get_member(context.bot.id)
             is_admin = bot_member.status in ['administrator', 'creator']
             admin_status = "✅ Admin" if is_admin else "❌ Not Admin"
-        except:
+        except Exception as e:
+            logger.error(f"Admin check error: {e}")
             admin_status = "❓ Unknown"
         
         status_msg = (
@@ -252,7 +265,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recent ban alerts"""
     try:
-        conn = sqlite3.connect('protection_bot.db')
+        conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -289,7 +302,7 @@ async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Protection statistics"""
     try:
-        conn = sqlite3.connect('protection_bot.db')
+        conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
         
         cursor.execute('SELECT COUNT(*) FROM groups')
@@ -328,7 +341,7 @@ async def warned(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        conn = sqlite3.connect('protection_bot.db')
+        conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -370,7 +383,7 @@ async def protect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Save group info
-        conn = sqlite3.connect('protection_bot.db')
+        conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
         cursor.execute(
             'INSERT OR REPLACE INTO groups (group_id, group_title) VALUES (?, ?)',
@@ -385,8 +398,8 @@ async def protect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if risk_level != "safe":
             # Save risky message
             cursor.execute(
-                'INSERT INTO risky_messages (group_id, user_id, username, message_text, risk_type) VALUES (?, ?, ?, ?, ?)',
-                (update.effective_chat.id, update.effective_user.id, update.effective_user.username, message_text, ', '.join(risks))
+                'INSERT INTO risky_messages (group_id, user_id, username, message_text, risk_type, action_taken) VALUES (?, ?, ?, ?, ?, ?)',
+                (update.effective_chat.id, update.effective_user.id, update.effective_user.username, message_text, ', '.join(risks), "Monitoring")
             )
             
             action_taken = "Monitoring"
@@ -397,6 +410,12 @@ async def protect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if bot_member.status in ['administrator', 'creator']:
                     await update.message.delete()
                     action_taken = "Message deleted"
+                    
+                    # Update action taken in database
+                    cursor.execute(
+                        'UPDATE risky_messages SET action_taken = ? WHERE group_id = ? AND user_id = ? AND message_text = ?',
+                        (action_taken, update.effective_chat.id, update.effective_user.id, message_text)
+                    )
                     
                     # Add user warning
                     cursor.execute('''
@@ -427,10 +446,10 @@ async def protect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the protection bot"""
-    if not BOT_TOKEN or not ALERT_CHAT_ID:
-        print("❌ Missing BOT_TOKEN or ALERT_CHAT_ID!")
-        return
+    logger.info("🛡️ Starting Ban Protection Bot...")
+    logger.info(f"📧 Alerts will be sent to: {ALERT_CHAT_ID}")
     
+    # Create application with better error handling
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Add command handlers
@@ -440,12 +459,22 @@ def main():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("warned", warned))
     
-    # Add message protection handler
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, protect_messages))
+    # Add message protection handler - process all non-command messages
+    application.add_handler(MessageHandler(
+        filters.ALL & ~filters.COMMAND, 
+        protect_messages
+    ))
 
-    print("🛡️ Ban Protection Bot is running...")
-    print(f"📧 Alerts will be sent to: {ALERT_CHAT_ID}")
-    application.run_polling()
+    # Start the bot with error handling
+    try:
+        logger.info("✅ Bot is running and monitoring...")
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
+    except Exception as e:
+        logger.error(f"Bot failed to start: {e}")
+        raise
 
 if __name__ == '__main__':
     main()
