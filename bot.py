@@ -1,36 +1,61 @@
 import os
 import logging
-from telegram import Update
+from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import sqlite3
 from datetime import datetime, timedelta
 
 # Setup
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+ALERT_CHAT_ID = os.getenv('ALERT_CHAT_ID')  # Your Telegram ID for ban alerts
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database setup
 def init_db():
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect('protection_bot.db')
     cursor = conn.cursor()
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS groups (
             group_id INTEGER PRIMARY KEY,
             group_title TEXT,
-            last_updated TIMESTAMP
+            added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_activity (
+        CREATE TABLE IF NOT EXISTS risky_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            message_text TEXT,
+            risk_type TEXT,
+            action_taken TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_warnings (
             user_id INTEGER,
             group_id INTEGER,
-            last_active TIMESTAMP,
-            message_count INTEGER DEFAULT 0,
+            warning_count INTEGER DEFAULT 0,
+            last_warning TIMESTAMP,
+            is_banned BOOLEAN DEFAULT FALSE,
             PRIMARY KEY (user_id, group_id)
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ban_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER,
+            alert_type TEXT,
+            alert_message TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -39,113 +64,184 @@ def init_db():
 
 init_db()
 
+class BanProtection:
+    def __init__(self):
+        self.spam_keywords = [
+            'http://', 'https://', '.com', '.org', '.net', '.xyz',
+            'buy now', 'click here', 'limited offer', 'discount',
+            'make money', 'earn cash', 'work from home', 'investment',
+            'bitcoin', 'crypto', 'free money'
+        ]
+        
+        self.bad_words = [
+            'fuck', 'shit', 'asshole', 'bitch', 'dick', 'porn',
+            'nude', 'sex', 'drugs', 'weed', 'cocaine', 'heroin'
+        ]
+        
+        self.scam_phrases = [
+            'send money', 'bank transfer', 'password', 'login',
+            'verify account', 'security check', 'admin contact',
+            'telegram support', 'official group'
+        ]
+    
+    def check_message_risk(self, text):
+        """Check message for ban risks"""
+        if not text:
+            return "safe", []
+        
+        text_lower = text.lower()
+        risks = []
+        risk_level = "safe"
+        
+        # Check for spam
+        spam_count = sum(1 for keyword in self.spam_keywords if keyword in text_lower)
+        if spam_count >= 2:
+            risks.append("spam_links")
+            risk_level = "high"
+        elif spam_count == 1:
+            risks.append("suspicious_link")
+            risk_level = "medium"
+        
+        # Check for bad words
+        bad_word_count = sum(1 for word in self.bad_words if word in text_lower)
+        if bad_word_count >= 2:
+            risks.append("inappropriate_content")
+            risk_level = "high"
+        elif bad_word_count == 1:
+            risks.append("mild_inappropriate")
+            risk_level = "medium"
+        
+        # Check for scam phrases
+        if any(phrase in text_lower for phrase in self.scam_phrases):
+            risks.append("scam_attempt")
+            risk_level = "high"
+        
+        # Check for excessive caps
+        if len(text) > 10:
+            caps_count = sum(1 for char in text if char.isupper())
+            if caps_count / len(text) > 0.7:
+                risks.append("caps_spam")
+                risk_level = "medium"
+        
+        return risk_level, risks
+
+async def send_ban_alert(context, group_title, username, user_id, message_text, risk_type, action_taken):
+    """Send ban risk alert to owner"""
+    try:
+        alert_msg = (
+            f"🚨 *BAN RISK ALERT*\n\n"
+            f"*Group:* {group_title}\n"
+            f"*User:* @{username or 'No username'} (ID: `{user_id}`)\n"
+            f"*Risk Type:* {risk_type}\n"
+            f"*Action Taken:* {action_taken}\n"
+            f"*Message:* {message_text[:200]}\n\n"
+            f"⏰ *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        await context.bot.send_message(
+            chat_id=ALERT_CHAT_ID,
+            text=alert_msg,
+            parse_mode='Markdown'
+        )
+        
+        # Save alert to database
+        conn = sqlite3.connect('protection_bot.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO ban_alerts (group_id, alert_type, alert_message) VALUES (?, ?, ?)',
+            (user_id, risk_type, alert_msg)
+        )
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Alert error: {e}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     if update.effective_chat.type == "private":
         await update.message.reply_text(
-            "🤖 *Group Monitor Bot*\n\n"
-            "*Available Commands:*\n"
+            "🛡️ *Group Protection Bot*\n\n"
+            "*I protect your groups from ban risks!*\n\n"
+            "*Commands:*\n"
             "/start - Show this menu\n"
-            "/help - Get help\n"
-            "/status - Group health status\n"
-            "/stats - Detailed statistics\n"
-            "/top - Top active users\n"
-            "/info - Bot information\n\n"
-            "Add me to your group to start monitoring activity!",
+            "/status - Protection status\n"
+            "/alerts - Recent ban alerts\n"
+            "/stats - Protection statistics\n"
+            "/warned - List warned users\n\n"
+            "*Features:*\n"
+            "• Auto-detect spam & scams\n"
+            "• Remove inappropriate content\n"
+            "• Alert owner of ban risks\n"
+            "• Track warned users\n\n"
+            "Add me to your group as ADMIN to enable full protection!",
             parse_mode='Markdown'
         )
     else:
         # Save group info
-        conn = sqlite3.connect('bot_data.db')
+        conn = sqlite3.connect('protection_bot.db')
         cursor = conn.cursor()
         cursor.execute(
-            'INSERT OR REPLACE INTO groups (group_id, group_title, last_updated) VALUES (?, ?, ?)',
-            (update.effective_chat.id, update.effective_chat.title, datetime.now())
+            'INSERT OR REPLACE INTO groups (group_id, group_title) VALUES (?, ?)',
+            (update.effective_chat.id, update.effective_chat.title)
         )
         conn.commit()
         conn.close()
         
         await update.message.reply_text(
-            "🛡️ *Group Monitor Activated!*\n\n"
-            "I'm now tracking activity in this group.\n"
-            "Use /help to see available commands.",
+            "🛡️ *Protection Activated!*\n\n"
+            "I'm now monitoring this group for ban risks.\n"
+            "I will delete risky messages and alert the owner.\n\n"
+            "Use /status to check protection status.",
             parse_mode='Markdown'
         )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
-    help_text = (
-        "📖 *Bot Help Guide*\n\n"
-        "*Commands Available:*\n"
-        "• /start - Show main menu\n"
-        "• /help - This help message\n"
-        "• /status - Group health & activity\n"
-        "• /stats - Message statistics\n"
-        "• /top - Most active users\n"
-        "• /info - Bot information\n\n"
-        "*How I Work:*\n"
-        "• I track messages in groups\n"
-        "• No admin rights needed\n"
-        "• I store activity data locally\n"
-        "• I don't store message content\n\n"
-        "Just add me to any group and I'll start monitoring!"
-    )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Group status check"""
+    """Protection status"""
     if update.effective_chat.type == "private":
         await update.message.reply_text("❌ *This command works in groups only!*", parse_mode='Markdown')
         return
     
     try:
-        conn = sqlite3.connect('bot_data.db')
+        conn = sqlite3.connect('protection_bot.db')
         cursor = conn.cursor()
         
-        # Get active members (last 24 hours)
-        twenty_four_hours_ago = datetime.now() - timedelta(hours=24)
+        # Get stats for this group
         cursor.execute(
-            'SELECT COUNT(DISTINCT user_id) FROM user_activity WHERE group_id = ? AND last_active > ?',
-            (update.effective_chat.id, twenty_four_hours_ago)
-        )
-        active_members = cursor.fetchone()[0] or 0
-        
-        # Get total tracked members
-        cursor.execute(
-            'SELECT COUNT(DISTINCT user_id) FROM user_activity WHERE group_id = ?',
+            'SELECT COUNT(*) FROM risky_messages WHERE group_id = ?',
             (update.effective_chat.id,)
         )
-        total_tracked = cursor.fetchone()[0] or 0
+        risky_count = cursor.fetchone()[0] or 0
         
-        # Get today's messages
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         cursor.execute(
-            'SELECT COUNT(*) FROM user_activity WHERE group_id = ? AND last_active > ?',
-            (update.effective_chat.id, today_start)
+            'SELECT COUNT(*) FROM user_warnings WHERE group_id = ?',
+            (update.effective_chat.id,)
         )
-        today_messages = cursor.fetchone()[0] or 0
+        warned_users = cursor.fetchone()[0] or 0
         
-        # Health assessment
-        if active_members >= 10:
-            health = "💚 Excellent"
-        elif active_members >= 5:
-            health = "💛 Good"
-        elif active_members >= 2:
-            health = "🟡 Normal"
+        # Check if bot is admin
+        try:
+            bot_member = await update.effective_chat.get_member(context.bot.id)
+            is_admin = bot_member.status in ['administrator', 'creator']
+            admin_status = "✅ Admin" if is_admin else "❌ Not Admin"
+        except:
+            admin_status = "❓ Unknown"
+        
+        status_msg = (
+            f"🛡️ *Protection Status*\n\n"
+            f"*Group:* {update.effective_chat.title}\n"
+            f"*Bot Status:* {admin_status}\n"
+            f"*Risky Messages Blocked:* {risky_count}\n"
+            f"*Users Warned:* {warned_users}\n"
+            f"*Alerts Sent:* Active\n\n"
+        )
+        
+        if admin_status == "❌ Not Admin":
+            status_msg += "*⚠️ Make me ADMIN for full protection!*"
         else:
-            health = "🔴 Low"
+            status_msg += "*✅ Full protection enabled!*"
         
-        response = (
-            f"🏥 *Group Health Status*\n\n"
-            f"*Health:* {health}\n"
-            f"*Active Members (24h):* {active_members}\n"
-            f"*Total Tracked Members:* {total_tracked}\n"
-            f"*Today's Messages:* {today_messages}\n"
-            f"*Group:* {update.effective_chat.title}\n\n"
-            f"⏰ *Last Updated:* {datetime.now().strftime('%H:%M:%S')}"
-        )
-        
-        await update.message.reply_text(response, parse_mode='Markdown')
+        await update.message.reply_text(status_msg, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Status error: {e}")
@@ -153,48 +249,71 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close()
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Group statistics"""
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ *This command works in groups only!*", parse_mode='Markdown')
-        return
-    
+async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recent ban alerts"""
     try:
-        conn = sqlite3.connect('bot_data.db')
+        conn = sqlite3.connect('protection_bot.db')
         cursor = conn.cursor()
         
-        # Get total messages
-        cursor.execute(
-            'SELECT SUM(message_count) FROM user_activity WHERE group_id = ?',
-            (update.effective_chat.id,)
-        )
-        total_messages = cursor.fetchone()[0] or 0
+        cursor.execute('''
+            SELECT alert_type, alert_message, timestamp 
+            FROM ban_alerts 
+            ORDER BY timestamp DESC 
+            LIMIT 5
+        ''')
         
-        # Get active members (last 7 days)
-        week_ago = datetime.now() - timedelta(days=7)
-        cursor.execute(
-            'SELECT COUNT(DISTINCT user_id) FROM user_activity WHERE group_id = ? AND last_active > ?',
-            (update.effective_chat.id, week_ago)
-        )
-        weekly_active = cursor.fetchone()[0] or 0
+        recent_alerts = cursor.fetchall()
         
-        # Get daily average
-        cursor.execute(
-            'SELECT AVG(message_count) FROM user_activity WHERE group_id = ?',
-            (update.effective_chat.id,)
-        )
-        avg_messages = cursor.fetchone()[0] or 0
+        if not recent_alerts:
+            await update.message.reply_text("📊 *No alerts yet!*", parse_mode='Markdown')
+            return
         
-        response = (
-            f"📊 *Group Statistics*\n\n"
-            f"*Total Messages:* {total_messages}\n"
-            f"*Weekly Active Users:* {weekly_active}\n"
-            f"*Avg Messages per User:* {avg_messages:.1f}\n"
-            f"*Group Size:* Unknown (bot needs admin for exact count)\n\n"
-            f"*Tracking since:* {datetime.now().strftime('%Y-%m-%d')}"
-        )
+        response = "🚨 *Recent Ban Alerts*\n\n"
+        
+        for alert_type, alert_msg, timestamp in recent_alerts:
+            time_ago = datetime.now() - datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+            hours_ago = int(time_ago.total_seconds() / 3600)
+            
+            response += f"• *{alert_type}* - {hours_ago}h ago\n"
+        
+        response += f"\n*Total alerts sent to owner:* {len(recent_alerts)}"
         
         await update.message.reply_text(response, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Alerts error: {e}")
+        await update.message.reply_text("❌ Error getting alerts")
+    finally:
+        conn.close()
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Protection statistics"""
+    try:
+        conn = sqlite3.connect('protection_bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) FROM groups')
+        protected_groups = cursor.fetchone()[0] or 0
+        
+        cursor.execute('SELECT COUNT(*) FROM risky_messages')
+        total_blocked = cursor.fetchone()[0] or 0
+        
+        cursor.execute('SELECT COUNT(*) FROM user_warnings')
+        total_warned = cursor.fetchone()[0] or 0
+        
+        cursor.execute('SELECT COUNT(*) FROM ban_alerts')
+        total_alerts = cursor.fetchone()[0] or 0
+        
+        stats_msg = (
+            f"📊 *Protection Statistics*\n\n"
+            f"*Protected Groups:* {protected_groups}\n"
+            f"*Messages Blocked:* {total_blocked}\n"
+            f"*Users Warned:* {total_warned}\n"
+            f"*Alerts Sent:* {total_alerts}\n\n"
+            f"*Last Update:* {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        
+        await update.message.reply_text(stats_msg, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Stats error: {e}")
@@ -202,69 +321,47 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close()
 
-async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Top active users"""
+async def warned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List warned users"""
     if update.effective_chat.type == "private":
         await update.message.reply_text("❌ *This command works in groups only!*", parse_mode='Markdown')
         return
     
     try:
-        conn = sqlite3.connect('bot_data.db')
+        conn = sqlite3.connect('protection_bot.db')
         cursor = conn.cursor()
         
-        # Get top 10 active users
         cursor.execute('''
-            SELECT user_id, message_count 
-            FROM user_activity 
+            SELECT user_id, warning_count, last_warning 
+            FROM user_warnings 
             WHERE group_id = ? 
-            ORDER BY message_count DESC 
+            ORDER BY warning_count DESC 
             LIMIT 10
         ''', (update.effective_chat.id,))
         
-        top_users = cursor.fetchall()
+        warned_users = cursor.fetchall()
         
-        if not top_users:
-            await update.message.reply_text("📝 *No activity data yet!*", parse_mode='Markdown')
+        if not warned_users:
+            await update.message.reply_text("✅ *No warned users in this group!*", parse_mode='Markdown')
             return
         
-        response = "🏆 *Top Active Users*\n\n"
+        response = "⚠️ *Warned Users*\n\n"
         
-        for i, (user_id, count) in enumerate(top_users, 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            response += f"{medal} User `{user_id}`: *{count}* messages\n"
+        for user_id, count, last_warn in warned_users:
+            response += f"• User `{user_id}`: {count} warnings\n"
         
-        response += f"\n*Total tracked users:* {len(top_users)}"
+        response += f"\n*Total warned users:* {len(warned_users)}"
         
         await update.message.reply_text(response, parse_mode='Markdown')
         
     except Exception as e:
-        logger.error(f"Top error: {e}")
-        await update.message.reply_text("❌ Error getting top users")
+        logger.error(f"Warned error: {e}")
+        await update.message.reply_text("❌ Error getting warned users")
     finally:
         conn.close()
 
-async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot information"""
-    info_text = (
-        "🤖 *Group Monitor Bot*\n\n"
-        "*Version:* 2.0\n"
-        "*Purpose:* Track group activity and statistics\n"
-        "*Features:*\n"
-        "  • Message counting\n"
-        "  • User activity tracking\n"
-        "  • Group health monitoring\n"
-        "  • No admin rights required\n\n"
-        "*Privacy:*\n"
-        "  • I don't store message content\n"
-        "  • Only track message counts\n"
-        "  • Data stored locally\n\n"
-        "*Developer:* @YourUsername\n"
-        "*Source:* Private"
-    )
-    await update.message.reply_text(info_text, parse_mode='Markdown')
-
-async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track all messages in groups"""
+async def protect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Monitor and protect against ban risks"""
     if not update.message or not update.effective_user:
         return
     
@@ -272,55 +369,82 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        conn = sqlite3.connect('bot_data.db')
-        cursor = conn.cursor()
-        
         # Save group info
+        conn = sqlite3.connect('protection_bot.db')
+        cursor = conn.cursor()
         cursor.execute(
-            'INSERT OR REPLACE INTO groups (group_id, group_title, last_updated) VALUES (?, ?, ?)',
-            (update.effective_chat.id, update.effective_chat.title, datetime.now())
+            'INSERT OR REPLACE INTO groups (group_id, group_title) VALUES (?, ?)',
+            (update.effective_chat.id, update.effective_chat.title)
         )
         
-        # Track user activity
-        cursor.execute('''
-            INSERT OR REPLACE INTO user_activity 
-            (user_id, group_id, last_active, message_count)
-            VALUES (?, ?, ?, COALESCE((SELECT message_count FROM user_activity WHERE user_id = ? AND group_id = ?), 0) + 1)
-        ''', (
-            update.effective_user.id, 
-            update.effective_chat.id, 
-            datetime.now(),
-            update.effective_user.id,
-            update.effective_chat.id
-        ))
+        protection = BanProtection()
+        message_text = update.message.text or update.message.caption or ""
+        
+        risk_level, risks = protection.check_message_risk(message_text)
+        
+        if risk_level != "safe":
+            # Save risky message
+            cursor.execute(
+                'INSERT INTO risky_messages (group_id, user_id, username, message_text, risk_type) VALUES (?, ?, ?, ?, ?)',
+                (update.effective_chat.id, update.effective_user.id, update.effective_user.username, message_text, ', '.join(risks))
+            )
+            
+            action_taken = "Monitoring"
+            
+            # Try to delete message if bot is admin
+            try:
+                bot_member = await update.effective_chat.get_member(context.bot.id)
+                if bot_member.status in ['administrator', 'creator']:
+                    await update.message.delete()
+                    action_taken = "Message deleted"
+                    
+                    # Add user warning
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO user_warnings 
+                        (user_id, group_id, warning_count, last_warning)
+                        VALUES (?, ?, COALESCE((SELECT warning_count FROM user_warnings WHERE user_id = ? AND group_id = ?), 0) + 1, ?)
+                    ''', (update.effective_user.id, update.effective_chat.id, update.effective_user.id, update.effective_chat.id, datetime.now()))
+            except Exception as e:
+                logger.error(f"Delete failed: {e}")
+                action_taken = "Delete failed (need admin)"
+            
+            # Send alert to owner
+            await send_ban_alert(
+                context,
+                update.effective_chat.title,
+                update.effective_user.username,
+                update.effective_user.id,
+                message_text,
+                ', '.join(risks),
+                action_taken
+            )
         
         conn.commit()
         conn.close()
         
     except Exception as e:
-        logger.error(f"Track error: {e}")
+        logger.error(f"Protection error: {e}")
 
 def main():
-    """Start the bot"""
-    if not BOT_TOKEN:
-        print("❌ No BOT_TOKEN found!")
+    """Start the protection bot"""
+    if not BOT_TOKEN or not ALERT_CHAT_ID:
+        print("❌ Missing BOT_TOKEN or ALERT_CHAT_ID!")
         return
     
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("alerts", alerts))
     application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("top", top))
-    application.add_handler(CommandHandler("info", info))
+    application.add_handler(CommandHandler("warned", warned))
     
-    # Add message handler for tracking
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_message))
+    # Add message protection handler
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, protect_messages))
 
-    print("✅ Bot is running with updated menu...")
-    print("🤖 Available commands: /start, /help, /status, /stats, /top, /info")
+    print("🛡️ Ban Protection Bot is running...")
+    print(f"📧 Alerts will be sent to: {ALERT_CHAT_ID}")
     application.run_polling()
 
 if __name__ == '__main__':
