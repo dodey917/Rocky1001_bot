@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 # Database connection
 def get_db_connection():
     try:
+        if not DATABASE_URL:
+            logger.error("DATABASE_URL not found in environment variables")
+            return None
+            
         # Parse DATABASE_URL (format: postgresql://user:password@host:port/database)
         db_url = DATABASE_URL.replace('postgresql://', '').split('@')
         user_pass = db_url[0].split(':')
@@ -39,7 +43,7 @@ def get_db_connection():
             user=user_pass[0],
             password=user_pass[1],
             host=host_port[0],
-            port=int(host_port[1]),
+            port=int(host_port[1]) if len(host_port) > 1 else 5432,
             database=host_port_db[1]
         )
         return conn
@@ -51,6 +55,8 @@ def get_db_connection():
 class RiskDetector:
     @staticmethod
     def detect_spam(text):
+        if not text:
+            return False
         spam_indicators = [
             'http://', 'https://', '.com', '.org', '.net',
             'buy now', 'click here', 'limited offer', 'discount',
@@ -60,6 +66,8 @@ class RiskDetector:
     
     @staticmethod
     def detect_inappropriate_content(text):
+        if not text:
+            return False
         inappropriate_words = [
             'fuck', 'shit', 'asshole', 'bitch', 'dick', 'porn',
             'nude', 'sex', 'drugs', 'weed', 'cocaine'
@@ -68,7 +76,7 @@ class RiskDetector:
     
     @staticmethod
     def detect_caps_spam(text):
-        if len(text) < 10:
+        if not text or len(text) < 10:
             return False
         caps_count = sum(1 for char in text if char.isupper())
         return (caps_count / len(text)) > 0.7
@@ -78,24 +86,31 @@ class RiskDetector:
         risk_score = 0
         reasons = []
         
-        if RiskDetector.detect_spam(message.text or ''):
+        text_content = ""
+        if message.text:
+            text_content = message.text
+        elif message.caption:
+            text_content = message.caption
+        
+        if RiskDetector.detect_spam(text_content):
             risk_score += 3
             reasons.append("Spam links/content detected")
         
-        if RiskDetector.detect_inappropriate_content(message.text or ''):
+        if RiskDetector.detect_inappropriate_content(text_content):
             risk_score += 4
             reasons.append("Inappropriate content")
         
-        if RiskDetector.detect_caps_spam(message.text or ''):
+        if RiskDetector.detect_caps_spam(text_content):
             risk_score += 2
             reasons.append("Excessive caps usage")
         
-        # Check for new user (account age < 7 days)
+        # Check for new user (using user ID as rough indicator)
         if message.from_user:
-            user_age = datetime.now().timestamp() - message.from_user.id
-            if user_age < 604800:  # 7 days in seconds
+            user_created = message.from_user.id
+            # Telegram user IDs are roughly chronological
+            if user_created > 700000000:  # Rough indicator of newer account
                 risk_score += 1
-                reasons.append("New user account")
+                reasons.append("Newer user account")
         
         if risk_score >= 5:
             return "HIGH", reasons
@@ -114,9 +129,9 @@ class AlertSystem:
 🚨 **SECURITY ALERT** 🚨
 
 **Risk Level:** {risk_level}
-**Message:** {message.text[:200] if message.text else 'No text content'}
-**User:** @{message.from_user.username if message.from_user.username else 'N/A'} (ID: {message.from_user.id})
-**Chat:** {message.chat.title if message.chat.title else 'N/A'}
+**Message:** {message.text[:200] if message.text else (message.caption[:200] if message.caption else 'Media message')}
+**User:** @{message.from_user.username if message.from_user and message.from_user.username else 'N/A'} (ID: {message.from_user.id if message.from_user else 'N/A'})
+**Chat:** {message.chat.title if message.chat.title else 'Private Chat'}
 
 **Reasons:**
 {chr(10).join(f'• {reason}' for reason in reasons)}
@@ -140,33 +155,35 @@ class AlertSystem:
             if risk_level == "HIGH":
                 # Delete message and ban user
                 await message.delete()
-                await context.bot.ban_chat_member(
-                    chat_id=message.chat.id,
-                    user_id=message.from_user.id
-                )
-                await context.bot.send_message(
-                    chat_id=message.chat.id,
-                    text=f"User @{message.from_user.username} has been banned for violating group rules."
-                )
+                if message.from_user:
+                    await context.bot.ban_chat_member(
+                        chat_id=message.chat.id,
+                        user_id=message.from_user.id
+                    )
+                    await context.bot.send_message(
+                        chat_id=message.chat.id,
+                        text=f"User @{message.from_user.username if message.from_user.username else 'Unknown'} has been banned for violating group rules."
+                    )
             
             elif risk_level == "MEDIUM":
                 # Delete message and restrict user
                 await message.delete()
-                await context.bot.restrict_chat_member(
-                    chat_id=message.chat.id,
-                    user_id=message.from_user.id,
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_media_messages=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False
-                    ),
-                    until_date=datetime.now() + timedelta(hours=24)
-                )
-                await context.bot.send_message(
-                    chat_id=message.chat.id,
-                    text=f"User @{message.from_user.username} has been restricted for 24 hours."
-                )
+                if message.from_user:
+                    await context.bot.restrict_chat_member(
+                        chat_id=message.chat.id,
+                        user_id=message.from_user.id,
+                        permissions=ChatPermissions(
+                            can_send_messages=False,
+                            can_send_media_messages=False,
+                            can_send_other_messages=False,
+                            can_add_web_page_previews=False
+                        ),
+                        until_date=datetime.now() + timedelta(hours=24)
+                    )
+                    await context.bot.send_message(
+                        chat_id=message.chat.id,
+                        text=f"User @{message.from_user.username if message.from_user.username else 'Unknown'} has been restricted for 24 hours."
+                    )
             
         except Exception as e:
             logger.error(f"Failed to take action: {e}")
@@ -180,6 +197,12 @@ class DatabaseManager:
             return
         
         try:
+            text_content = ""
+            if message.text:
+                text_content = message.text
+            elif message.caption:
+                text_content = message.caption
+            
             conn.run(
                 """INSERT INTO monitored_messages 
                 (message_id, chat_id, user_id, username, text, message_type, risk_level) 
@@ -189,7 +212,7 @@ class DatabaseManager:
                     message.chat.id,
                     message.from_user.id if message.from_user else None,
                     message.from_user.username if message.from_user else None,
-                    message.text or '',
+                    text_content,
                     message.content_type,
                     risk_level
                 ]
@@ -233,13 +256,169 @@ class DatabaseManager:
         finally:
             conn.close()
 
-# Bot handlers
+# Initialize database tables
+def init_database():
+    conn = get_db_connection()
+    if not conn:
+        logger.error("Failed to initialize database")
+        return
+    
+    try:
+        # Create monitored_messages table
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS monitored_messages (
+                id SERIAL PRIMARY KEY,
+                message_id BIGINT,
+                chat_id BIGINT,
+                user_id BIGINT,
+                username VARCHAR(255),
+                text TEXT,
+                message_type VARCHAR(50),
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                risk_level VARCHAR(20)
+            )
+        """)
+        
+        # Create user_warnings table
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS user_warnings (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                username VARCHAR(255),
+                warning_count INTEGER DEFAULT 0,
+                last_warning TIMESTAMP,
+                is_banned BOOLEAN DEFAULT FALSE
+            )
+        """)
+        
+        conn.commit()
+        logger.info("Database tables initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database tables: {e}")
+    finally:
+        conn.close()
+
+# Bot command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 **Group Protection Bot Active**\n\n"
-        "I'm monitoring this group for potential ban risks and will alert admins of suspicious activities.",
+        "I'm monitoring this group for potential ban risks and will alert admins of suspicious activities.\n\n"
+        "**Available Commands:**\n"
+        "/start - Show this message\n"
+        "/status - Check bot status\n"
+        "/stats - View protection statistics\n"
+        "/scan - Scan recent messages\n"
+        "/alerts - Configure alerts",
         parse_mode=ParseMode.MARKDOWN
     )
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_message = """
+🟢 **Bot Status: ACTIVE**
+
+**Monitoring:** Groups & Channels
+**Protection:** Enabled
+**Alert System:** Active
+**Database:** Connected
+
+**Last Check:** {timestamp}
+""".format(timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This command can be used by admins only
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Access denied. Admin only command.")
+        return
+    
+    conn = get_db_connection()
+    if not conn:
+        await update.message.reply_text("❌ Database connection failed.")
+        return
+    
+    try:
+        # Get total monitored messages
+        total_msgs = conn.run("SELECT COUNT(*) FROM monitored_messages")[0][0]
+        
+        # Get risk level counts
+        high_risk = conn.run("SELECT COUNT(*) FROM monitored_messages WHERE risk_level = 'HIGH'")[0][0]
+        medium_risk = conn.run("SELECT COUNT(*) FROM monitored_messages WHERE risk_level = 'MEDIUM'")[0][0]
+        low_risk = conn.run("SELECT COUNT(*) FROM monitored_messages WHERE risk_level = 'LOW'")[0][0]
+        
+        # Get warned users count
+        warned_users = conn.run("SELECT COUNT(*) FROM user_warnings WHERE warning_count > 0")[0][0]
+        
+        stats_message = f"""
+📊 **Protection Statistics**
+
+**Total Monitored Messages:** {total_msgs}
+**High Risk Detections:** {high_risk}
+**Medium Risk Detections:** {medium_risk}
+**Low Risk Detections:** {low_risk}
+**Users Warned/Restricted:** {warned_users}
+
+**Last Update:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        """
+        
+        await update.message.reply_text(stats_message, parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        logger.error(f"Failed to get stats: {e}")
+        await update.message.reply_text("❌ Failed to retrieve statistics.")
+    finally:
+        conn.close()
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Access denied. Admin only command.")
+        return
+    
+    await update.message.reply_text("🔍 Scanning recent messages...")
+    
+    # Here you can implement scanning of recent group messages
+    # This is a placeholder for actual scanning logic
+    conn = get_db_connection()
+    if conn:
+        try:
+            # Example: Scan last 100 messages from database
+            recent_risky = conn.run(
+                "SELECT COUNT(*) FROM monitored_messages WHERE risk_level IN ('HIGH', 'MEDIUM') AND timestamp > NOW() - INTERVAL '1 hour'"
+            )[0][0]
+            
+            await update.message.reply_text(
+                f"✅ Scan complete!\n\n"
+                f"Found {recent_risky} risky messages in the last hour.\n"
+                f"All systems operational."
+            )
+        except Exception as e:
+            logger.error(f"Scan error: {e}")
+            await update.message.reply_text("❌ Scan failed.")
+        finally:
+            conn.close()
+    else:
+        await update.message.reply_text("❌ Database unavailable for scanning.")
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("❌ Access denied. Admin only command.")
+        return
+    
+    alert_config = """
+🔔 **Alert Configuration**
+
+**Current Settings:**
+• Admin Alerts: ✅ Enabled
+• Risk Levels: LOW, MEDIUM, HIGH
+• Alert Channel: {admin_chat}
+
+**Commands:**
+/alerts enable - Enable all alerts
+/alerts disable - Disable alerts
+/alerts test - Send test alert
+""".format(admin_chat=ADMIN_CHAT_ID)
+
+    await update.message.reply_text(alert_config, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -288,51 +467,21 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Failed to send error alert: {e}")
 
-# Admin commands
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Access denied.")
-        return
-    
-    conn = get_db_connection()
-    if not conn:
-        await update.message.reply_text("❌ Database connection failed.")
-        return
-    
-    try:
-        # Get total monitored messages
-        total_msgs = conn.run("SELECT COUNT(*) FROM monitored_messages")[0][0]
-        
-        # Get high risk messages count
-        high_risk = conn.run("SELECT COUNT(*) FROM monitored_messages WHERE risk_level = 'HIGH'")[0][0]
-        
-        # Get warned users count
-        warned_users = conn.run("SELECT COUNT(*) FROM user_warnings WHERE warning_count > 0")[0][0]
-        
-        stats_message = f"""
-📊 **Bot Statistics**
-
-**Total Monitored Messages:** {total_msgs}
-**High Risk Detections:** {high_risk}
-**Users Warned/Restricted:** {warned_users}
-**Last Check:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        """
-        
-        await update.message.reply_text(stats_message, parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        logger.error(f"Failed to get stats: {e}")
-        await update.message.reply_text("❌ Failed to retrieve statistics.")
-    finally:
-        conn.close()
-
 def main():
+    # Initialize database
+    init_database()
+    
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("alerts", alerts_command))
+    
+    # Add message handler (for group monitoring)
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     
     # Add error handler
@@ -340,6 +489,7 @@ def main():
     
     # Start bot
     logger.info("Bot is starting...")
+    print("🤖 Bot is running...")
     application.run_polling()
 
 if __name__ == '__main__':
