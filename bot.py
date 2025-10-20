@@ -5,15 +5,17 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 import sqlite3
 from datetime import datetime, timedelta
 
-# Render environment variables
+# Render environment variables with fallbacks
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ALERT_CHAT_ID = os.environ.get('ALERT_CHAT_ID')
 
 # Validate required environment variables
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
+
+# If ALERT_CHAT_ID is not set, the bot will still work but won't send alerts
 if not ALERT_CHAT_ID:
-    raise ValueError("ALERT_CHAT_ID environment variable is required")
+    print("⚠️  ALERT_CHAT_ID not set. Alerts will be disabled.")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -21,9 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Database setup - Render provides persistent storage
+# Database setup
 def init_db():
-    conn = sqlite3.connect('/tmp/protection_bot.db')  # Use /tmp for Render compatibility
+    conn = sqlite3.connect('/tmp/protection_bot.db')
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -137,6 +139,10 @@ class BanProtection:
 
 async def send_ban_alert(context, group_title, username, user_id, message_text, risk_type, action_taken):
     """Send ban risk alert to owner"""
+    if not ALERT_CHAT_ID:
+        logger.warning("ALERT_CHAT_ID not set - skipping alert")
+        return
+        
     try:
         alert_msg = (
             f"🚨 *BAN RISK ALERT*\n\n"
@@ -172,9 +178,11 @@ async def send_ban_alert(context, group_title, username, user_id, message_text, 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     if update.effective_chat.type == "private":
+        alert_status = "✅ Enabled" if ALERT_CHAT_ID else "❌ Disabled"
+        
         await update.message.reply_text(
-            "🛡️ *Group Protection Bot*\n\n"
-            "*I protect your groups from ban risks!*\n\n"
+            f"🛡️ *Group Protection Bot*\n\n"
+            f"*Alert System:* {alert_status}\n\n"
             "*Commands:*\n"
             "/start - Show this menu\n"
             "/status - Protection status\n"
@@ -200,8 +208,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         
+        alert_status = "✅ Enabled" if ALERT_CHAT_ID else "❌ Disabled"
+        
         await update.message.reply_text(
-            "🛡️ *Protection Activated!*\n\n"
+            f"🛡️ *Protection Activated!*\n\n"
+            f"*Alert System:* {alert_status}\n"
             "I'm now monitoring this group for ban risks.\n"
             "I will delete risky messages and alert the owner.\n\n"
             "Use /status to check protection status.",
@@ -240,19 +251,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Admin check error: {e}")
             admin_status = "❓ Unknown"
         
+        alert_status = "✅ Enabled" if ALERT_CHAT_ID else "❌ Disabled"
+        
         status_msg = (
             f"🛡️ *Protection Status*\n\n"
             f"*Group:* {update.effective_chat.title}\n"
             f"*Bot Status:* {admin_status}\n"
+            f"*Alert System:* {alert_status}\n"
             f"*Risky Messages Blocked:* {risky_count}\n"
-            f"*Users Warned:* {warned_users}\n"
-            f"*Alerts Sent:* Active\n\n"
+            f"*Users Warned:* {warned_users}\n\n"
         )
         
         if admin_status == "❌ Not Admin":
             status_msg += "*⚠️ Make me ADMIN for full protection!*"
         else:
             status_msg += "*✅ Full protection enabled!*"
+            
+        if not ALERT_CHAT_ID:
+            status_msg += "\n\n*⚠️ Set ALERT_CHAT_ID to receive alerts!*"
         
         await update.message.reply_text(status_msg, parse_mode='Markdown')
         
@@ -264,6 +280,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recent ban alerts"""
+    if not ALERT_CHAT_ID:
+        await update.message.reply_text(
+            "❌ *Alert system is disabled!*\n\n"
+            "Set ALERT_CHAT_ID environment variable to enable alerts.",
+            parse_mode='Markdown'
+        )
+        return
+        
     try:
         conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
@@ -317,11 +341,14 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute('SELECT COUNT(*) FROM ban_alerts')
         total_alerts = cursor.fetchone()[0] or 0
         
+        alert_status = "✅ Enabled" if ALERT_CHAT_ID else "❌ Disabled"
+        
         stats_msg = (
             f"📊 *Protection Statistics*\n\n"
             f"*Protected Groups:* {protected_groups}\n"
             f"*Messages Blocked:* {total_blocked}\n"
             f"*Users Warned:* {total_warned}\n"
+            f"*Alert System:* {alert_status}\n"
             f"*Alerts Sent:* {total_alerts}\n\n"
             f"*Last Update:* {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
@@ -447,7 +474,11 @@ async def protect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Start the protection bot"""
     logger.info("🛡️ Starting Ban Protection Bot...")
-    logger.info(f"📧 Alerts will be sent to: {ALERT_CHAT_ID}")
+    
+    if ALERT_CHAT_ID:
+        logger.info(f"📧 Alerts will be sent to: {ALERT_CHAT_ID}")
+    else:
+        logger.warning("⚠️  ALERT_CHAT_ID not set - alerts disabled")
     
     # Create application with better error handling
     application = Application.builder().token(BOT_TOKEN).build()
