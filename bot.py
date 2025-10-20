@@ -1,170 +1,201 @@
 import os
 import logging
-from datetime import datetime
-from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import psycopg2
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import sqlite3
+from datetime import datetime, timedelta
 
-# Load environment variables
-load_dotenv()
-
+# Setup
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
-DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database setup
 def init_db():
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS groups (
-                group_id BIGINT PRIMARY KEY,
-                group_name TEXT,
-                added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id SERIAL PRIMARY KEY,
-                group_id BIGINT,
-                user_id BIGINT,
-                username TEXT,
-                message_text TEXT,
-                message_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        print("✅ Database ready")
-    except Exception as e:
-        print(f"❌ Database error: {e}")
-
-def save_group(chat_id, chat_title):
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO groups (group_id, group_name) VALUES (%s, %s) ON CONFLICT (group_id) DO NOTHING",
-            (chat_id, chat_title)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"Save group error: {e}")
-
-def save_message(chat_id, user_id, username, message_text):
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO messages (group_id, user_id, username, message_text) VALUES (%s, %s, %s, %s)",
-            (chat_id, user_id, username, message_text)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"Save message error: {e}")
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
     
-    if chat.type in ["group", "supergroup"]:
-        save_group(chat.id, chat.title)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS groups (
+            group_id INTEGER PRIMARY KEY,
+            group_title TEXT,
+            last_updated TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_activity (
+            user_id INTEGER,
+            group_id INTEGER,
+            last_active TIMESTAMP,
+            message_count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, group_id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    if update.effective_chat.type == "private":
         await update.message.reply_text(
-            "🛡️ Protection Bot Active!\n"
-            "I'm monitoring this group and sending alerts to owner."
+            "🤖 Bot is running!\n\n"
+            "Commands:\n"
+            "/start - Start bot\n"
+            "/status - Group status\n"
+            "/stats - Group stats\n\n"
+            "Add me to groups to monitor activity!"
         )
     else:
-        await update.message.reply_text("Add me to a group to start monitoring!")
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"✅ Bot is running\n🕒 {datetime.now().strftime('%H:%M:%S')}")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        
-        cur.execute("SELECT COUNT(*) FROM groups")
-        group_count = cur.fetchone()[0]
-        
-        cur.execute("SELECT COUNT(*) FROM messages")
-        message_count = cur.fetchone()[0]
-        
-        cur.close()
+        # Save group info
+        conn = sqlite3.connect('bot_data.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT OR REPLACE INTO groups (group_id, group_title, last_updated) VALUES (?, ?, ?)',
+            (update.effective_chat.id, update.effective_chat.title, datetime.now())
+        )
+        conn.commit()
         conn.close()
         
-        await update.message.reply_text(
-            f"📊 Stats:\nGroups: {group_count}\nMessages: {message_count}"
-        )
-    except Exception as e:
-        await update.message.reply_text("❌ Could not get stats")
+        await update.message.reply_text("🔍 Bot is now monitoring this group!")
 
-async def handle_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    
-    if not message or not message.from_user or message.from_user.is_bot:
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group status check"""
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("This command works in groups only!")
         return
     
-    chat = update.effective_chat
-    
-    if chat.type in ["group", "supergroup"]:
-        # Save group and message
-        save_group(chat.id, chat.title)
+    try:
+        conn = sqlite3.connect('bot_data.db')
+        cursor = conn.cursor()
         
-        if message.text:
-            save_message(chat.id, message.from_user.id, message.from_user.username, message.text)
-            
-            # Send alert to owner
-            try:
-                alert_msg = f"📝 New message in {chat.title}\n👤 @{message.from_user.username or 'No username'}\n💬 {message.text[:100]}"
-                await context.bot.send_message(chat_id=CHAT_ID, text=alert_msg)
-            except Exception as e:
-                print(f"Alert error: {e}")
+        # Get active members (last 24 hours)
+        twenty_four_hours_ago = datetime.now() - timedelta(hours=24)
+        cursor.execute(
+            'SELECT COUNT(DISTINCT user_id) FROM user_activity WHERE group_id = ? AND last_active > ?',
+            (update.effective_chat.id, twenty_four_hours_ago)
+        )
+        active_members = cursor.fetchone()[0] or 0
+        
+        # Get total members who ever sent messages
+        cursor.execute(
+            'SELECT COUNT(DISTINCT user_id) FROM user_activity WHERE group_id = ?',
+            (update.effective_chat.id,)
+        )
+        total_tracked = cursor.fetchone()[0] or 0
+        
+        response = (
+            f"📊 Group Status\n\n"
+            f"Active members (24h): {active_members}\n"
+            f"Total tracked: {total_tracked}\n"
+            f"Group: {update.effective_chat.title}\n"
+            f"Last update: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        
+        await update.message.reply_text(response)
+        
+    except Exception as e:
+        logger.error(f"Status error: {e}")
+        await update.message.reply_text("Error getting status")
+    finally:
+        conn.close()
 
-async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.new_chat_members:
-        for user in update.message.new_chat_members:
-            if user.id == context.bot.id:
-                chat = update.effective_chat
-                save_group(chat.id, chat.title)
-                await update.message.reply_text("🛡️ Bot added! Monitoring this group.")
-                
-                # Alert owner
-                try:
-                    await context.bot.send_message(
-                        chat_id=CHAT_ID, 
-                        text=f"🤖 Bot added to: {chat.title}"
-                    )
-                except:
-                    pass
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group statistics"""
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("This command works in groups only!")
+        return
+    
+    try:
+        conn = sqlite3.connect('bot_data.db')
+        cursor = conn.cursor()
+        
+        # Get top active users
+        cursor.execute('''
+            SELECT user_id, message_count 
+            FROM user_activity 
+            WHERE group_id = ? 
+            ORDER BY message_count DESC 
+            LIMIT 5
+        ''', (update.effective_chat.id,))
+        
+        top_users = cursor.fetchall()
+        
+        # Get total messages
+        cursor.execute(
+            'SELECT SUM(message_count) FROM user_activity WHERE group_id = ?',
+            (update.effective_chat.id,)
+        )
+        total_messages = cursor.fetchone()[0] or 0
+        
+        response = f"📈 Group Stats\n\nTotal messages: {total_messages}\n\nTop users:\n"
+        
+        for user_id, count in top_users:
+            response += f"• User {user_id}: {count} messages\n"
+        
+        await update.message.reply_text(response)
+        
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        await update.message.reply_text("Error getting stats")
+    finally:
+        conn.close()
+
+async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track all messages in groups"""
+    if not update.message or not update.effective_user:
+        return
+    
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        return
+    
+    try:
+        conn = sqlite3.connect('bot_data.db')
+        cursor = conn.cursor()
+        
+        # Save group info
+        cursor.execute(
+            'INSERT OR REPLACE INTO groups (group_id, group_title, last_updated) VALUES (?, ?, ?)',
+            (update.effective_chat.id, update.effective_chat.title, datetime.now())
+        )
+        
+        # Track user activity
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_activity 
+            (user_id, group_id, last_active, message_count)
+            VALUES (?, ?, ?, COALESCE((SELECT message_count FROM user_activity WHERE user_id = ? AND group_id = ?), 0) + 1)
+        ''', (
+            update.effective_user.id, 
+            update.effective_chat.id, 
+            datetime.now(),
+            update.effective_user.id,
+            update.effective_chat.id
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Track error: {e}")
 
 def main():
-    print("🛡️ Starting Protection Bot...")
-    init_db()
+    """Start the bot"""
+    if not BOT_TOKEN:
+        print("❌ No BOT_TOKEN found!")
+        return
     
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
     # Add handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_messages))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_bot_added))
-    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, track_message))
+
     print("✅ Bot is running...")
     application.run_polling()
 
