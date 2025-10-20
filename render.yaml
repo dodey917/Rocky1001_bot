@@ -8,11 +8,5 @@ services:
     envVars:
       - key: BOT_TOKEN
         fromSecret: true
-      - key: ADMIN_CHAT_ID
-        fromSecret: true
-      - key: CHANNEL_USERNAME
-        fromSecret: true
-      - key: GROUP_ID
-        fromSecret: true
-      - key: DATABASE_URL
+      - key: CHAT_ID
         fromSecret: true
