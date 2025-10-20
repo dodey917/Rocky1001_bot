@@ -10,7 +10,7 @@ import psycopg2
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')  # Your Telegram ID for alerts
+CHAT_ID = os.getenv('CHAT_ID')
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 # Setup logging
@@ -25,8 +25,7 @@ def init_db():
         
         cur.execute('''
             CREATE TABLE IF NOT EXISTS groups (
-                id SERIAL PRIMARY KEY,
-                group_id BIGINT UNIQUE,
+                group_id BIGINT PRIMARY KEY,
                 group_name TEXT,
                 added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -46,9 +45,9 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Database initialized")
+        print("✅ Database ready")
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        print(f"❌ Database error: {e}")
 
 def save_group(chat_id, chat_title):
     try:
@@ -62,7 +61,7 @@ def save_group(chat_id, chat_title):
         cur.close()
         conn.close()
     except Exception as e:
-        logger.error(f"Save group error: {e}")
+        print(f"Save group error: {e}")
 
 def save_message(chat_id, user_id, username, message_text):
     try:
@@ -70,105 +69,30 @@ def save_message(chat_id, user_id, username, message_text):
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO messages (group_id, user_id, username, message_text) VALUES (%s, %s, %s, %s)",
-            (chat_id, user_id, username, message_text[:500])  # Limit text length
+            (chat_id, user_id, username, message_text)
         )
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
-        logger.error(f"Save message error: {e}")
-
-async def send_alert(context, message):
-    """Send alert to owner"""
-    try:
-        alert_msg = f"🚨 New message in {message.chat.title}\n👤 User: @{message.from_user.username or 'No username'}\n💬 Message: {message.text[:100] if message.text else 'Media'}\n⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
-        await context.bot.send_message(chat_id=CHAT_ID, text=alert_msg)
-    except Exception as e:
-        logger.error(f"Send alert error: {e}")
+        print(f"Save message error: {e}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
     chat = update.effective_chat
     
-    # Save group info if it's a group
     if chat.type in ["group", "supergroup"]:
         save_group(chat.id, chat.title)
         await update.message.reply_text(
-            "🛡️ Protection Bot Active!\n\n"
-            "I'm now monitoring this group and will alert the owner of activities.\n\n"
-            "Commands:\n"
-            "/start - Show this message\n"
-            "/status - Check bot status\n"
-            "/scan - Scan messages\n"
-            "/stats - Show statistics",
-            parse_mode='Markdown'
+            "🛡️ Protection Bot Active!\n"
+            "I'm monitoring this group and sending alerts to owner."
         )
     else:
-        await update.message.reply_text(
-            "🛡️ Protection Bot\n\n"
-            "Add me to your group to start monitoring!",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("Add me to a group to start monitoring!")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command"""
-    chat = update.effective_chat
-    
-    if chat.type in ["group", "supergroup"]:
-        # Check if bot is admin in group
-        try:
-            bot_member = await chat.get_member(context.bot.id)
-            is_admin = bot_member.status in ['administrator', 'creator']
-            admin_status = "✅ Admin" if is_admin else "❌ Not Admin"
-        except:
-            admin_status = "❓ Unknown"
-        
-        status_msg = (
-            f"🤖 Bot Status\n\n"
-            f"🟢 Online\n"
-            f"📊 Monitoring: Active\n"
-            f"🔔 Alerts: Enabled\n"
-            f"{admin_status}\n\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-    else:
-        status_msg = "🤖 Bot is running and ready!"
-    
-    await update.message.reply_text(status_msg)
-
-async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /scan command"""
-    chat = update.effective_chat
-    
-    if chat.type in ["group", "supergroup"]:
-        try:
-            await update.message.reply_text("🔍 Scanning recent messages...")
-            
-            # Get message count from database
-            conn = psycopg2.connect(DATABASE_URL)
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM messages WHERE group_id = %s", (chat.id,))
-            message_count = cur.fetchone()[0]
-            cur.close()
-            conn.close()
-            
-            scan_result = (
-                f"📊 Scan Results\n\n"
-                f"📝 Messages logged: {message_count}\n"
-                f"👥 Group: {chat.title}\n"
-                f"✅ Scan completed!"
-            )
-            
-            await update.message.reply_text(scan_result)
-            
-        except Exception as e:
-            logger.error(f"Scan error: {e}")
-            await update.message.reply_text("❌ Scan failed!")
-    else:
-        await update.message.reply_text("This command works only in groups!")
+    await update.message.reply_text(f"✅ Bot is running\n🕒 {datetime.now().strftime('%H:%M:%S')}")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command"""
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -177,98 +101,71 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_count = cur.fetchone()[0]
         
         cur.execute("SELECT COUNT(*) FROM messages")
-        total_messages = cur.fetchone()[0]
+        message_count = cur.fetchone()[0]
         
         cur.close()
         conn.close()
         
-        stats_msg = (
-            f"📈 Bot Statistics\n\n"
-            f"👥 Groups: {group_count}\n"
-            f"💬 Messages: {total_messages}\n"
-            f"🕒 Last update: {datetime.now().strftime('%H:%M:%S')}"
+        await update.message.reply_text(
+            f"📊 Stats:\nGroups: {group_count}\nMessages: {message_count}"
         )
-        
-        await update.message.reply_text(stats_msg)
-        
     except Exception as e:
-        logger.error(f"Stats error: {e}")
-        await update.message.reply_text("❌ Could not get statistics")
+        await update.message.reply_text("❌ Could not get stats")
 
-async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all incoming messages in groups"""
+async def handle_group_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     
-    if not message or not message.from_user:
-        return
-    
-    # Skip bot messages
-    if message.from_user.is_bot:
+    if not message or not message.from_user or message.from_user.is_bot:
         return
     
     chat = update.effective_chat
     
-    # Only process group messages
     if chat.type in ["group", "supergroup"]:
-        # Save group info
+        # Save group and message
         save_group(chat.id, chat.title)
         
-        # Save message to database
         if message.text:
             save_message(chat.id, message.from_user.id, message.from_user.username, message.text)
             
-            # Send alert for every message
-            await send_alert(context, message)
+            # Send alert to owner
+            try:
+                alert_msg = f"📝 New message in {chat.title}\n👤 @{message.from_user.username or 'No username'}\n💬 {message.text[:100]}"
+                await context.bot.send_message(chat_id=CHAT_ID, text=alert_msg)
+            except Exception as e:
+                print(f"Alert error: {e}")
 
-async def handle_group_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bot being added to groups"""
+async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.new_chat_members:
         for user in update.message.new_chat_members:
             if user.id == context.bot.id:
                 chat = update.effective_chat
                 save_group(chat.id, chat.title)
-                
-                # Send welcome message
-                await update.message.reply_text(
-                    "🛡️ Thanks for adding me!\n\n"
-                    "I will monitor this group and alert the owner of activities.\n\n"
-                    "Use /start to see available commands."
-                )
+                await update.message.reply_text("🛡️ Bot added! Monitoring this group.")
                 
                 # Alert owner
-                alert_msg = f"🤖 Bot added to group: {chat.title}\n👥 Group ID: {chat.id}"
-                await context.bot.send_message(chat_id=CHAT_ID, text=alert_msg)
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Error: {context.error}")
+                try:
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID, 
+                        text=f"🤖 Bot added to: {chat.title}"
+                    )
+                except:
+                    pass
 
 def main():
-    """Start the bot"""
     print("🛡️ Starting Protection Bot...")
-    
-    # Initialize database
     init_db()
     
-    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add command handlers - IMPORTANT: Add them first
+    # Add handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("stats", stats_command))
     
-    # Add message handlers - process after commands
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_group_events))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_messages))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_bot_added))
     
-    # Error handler
-    application.add_error_handler(error_handler)
-    
-    # Start bot
     print("✅ Bot is running...")
-    print("🤖 Add the bot to your group as ADMIN for best results!")
     application.run_polling()
 
 if __name__ == '__main__':
