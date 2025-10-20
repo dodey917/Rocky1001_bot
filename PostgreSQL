@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS monitored_messages (
+    id SERIAL PRIMARY KEY,
+    message_id BIGINT,
+    chat_id BIGINT,
+    user_id BIGINT,
+    username VARCHAR(255),
+    text TEXT,
+    message_type VARCHAR(50),
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    risk_level VARCHAR(20)
+);
+
+CREATE TABLE IF NOT EXISTS user_warnings (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT,
+    username VARCHAR(255),
+    warning_count INTEGER DEFAULT 0,
+    last_warning TIMESTAMP,
+    is_banned BOOLEAN DEFAULT FALSE
+);
