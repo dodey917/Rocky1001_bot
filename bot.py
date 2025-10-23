@@ -8,8 +8,7 @@ from datetime import datetime, timedelta
 # Render environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ALERT_CHAT_ID = os.environ.get('ALERT_CHAT_ID')
-ALLOWED_USER_IDS = [uid.strip() for uid in os.environ.get('ALLOWED_USER_IDS', '').split(',') if uid.strip()]
-ALLOWED_USERNAMES = [uname.strip().lstrip('@').lower() for uname in os.environ.get('ALLOWED_USERNAMES', '').split(',') if uname.strip()]
+AUTHORIZED_USER_ID = os.environ.get('AUTHORIZED_USER_ID')  # Your Telegram user ID
 
 # Validate required environment variables
 if not BOT_TOKEN:
@@ -74,49 +73,38 @@ def init_db():
 
 init_db()
 
-# Authorization functions
-def is_user_authorized(user_id: int, username: str) -> bool:
-    """
-    Check if user is authorized to use the bot
-    """
-    # Clean and prepare the username
-    clean_username = username.lstrip('@').lower() if username else ""
-    
-    # Check if user ID is in allowed list
-    if str(user_id) in ALLOWED_USER_IDS:
-        logger.info(f"User authorized by ID: {user_id}")
-        return True
-    
-    # Check if username is in allowed list
-    if clean_username and clean_username in ALLOWED_USERNAMES:
-        logger.info(f"User authorized by username: {clean_username}")
-        return True
-    
-    logger.warning(f"Unauthorized access - User ID: {user_id}, Username: {username}")
-    return False
-
-async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is authorized and send message if not"""
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "No username"
-    
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. This bot is not available for public use."
-        )
+def is_authorized_user(user_id):
+    """Check if user is authorized to use bot commands"""
+    if not AUTHORIZED_USER_ID:
         return False
-    return True
+    
+    try:
+        authorized_ids = [int(id.strip()) for id in AUTHORIZED_USER_ID.split(',')]
+        return user_id in authorized_ids
+    except (ValueError, AttributeError):
+        return str(user_id) == str(AUTHORIZED_USER_ID)
 
-async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all unauthorized access attempts - SILENTLY"""
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "No username"
-    
-    logger.warning(f"BLOCKED unauthorized access - User ID: {user_id}, Username: {username}")
-    
-    # Do not respond at all to unauthorized users
-    # This prevents them from knowing the bot exists
-    return
+async def authorized_only(func):
+    """Decorator to restrict command access to authorized users only"""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        if not is_authorized_user(user_id):
+            logger.warning(f"Unauthorized access attempt from user {user_id}")
+            
+            # Only respond in private chat, ignore in groups
+            if update.effective_chat.type == "private":
+                await update.message.reply_text(
+                    "❌ *Access Denied*\n\n"
+                    "You are not authorized to use this bot.\n"
+                    "This bot is restricted to authorized users only.",
+                    parse_mode='Markdown'
+                )
+            return
+        
+        # User is authorized, proceed with the command
+        return await func(update, context)
+    return wrapper
 
 class BanProtection:
     def __init__(self):
@@ -213,12 +201,9 @@ async def send_ban_alert(context, group_title, username, user_id, message_text, 
     except Exception as e:
         logger.error(f"Alert error: {e}")
 
+@authorized_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    # Check authorization first
-    if not await check_authorization(update, context):
-        return
-    
+    """Handle /start command - Authorized users only"""
     if update.effective_chat.type == "private":
         await update.message.reply_text(
             "🛡️ *Group Protection Bot*\n\n"
@@ -256,12 +241,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
+@authorized_only
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Protection status"""
-    # Check authorization first
-    if not await check_authorization(update, context):
-        return
-    
+    """Protection status - Authorized users only"""
     if update.effective_chat.type == "private":
         await update.message.reply_text("❌ *This command works in groups only!*", parse_mode='Markdown')
         return
@@ -314,12 +296,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close()
 
+@authorized_only
 async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recent ban alerts"""
-    # Check authorization first
-    if not await check_authorization(update, context):
-        return
-    
+    """Recent ban alerts - Authorized users only"""
     try:
         conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
@@ -355,12 +334,9 @@ async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close()
 
+@authorized_only
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Protection statistics"""
-    # Check authorization first
-    if not await check_authorization(update, context):
-        return
-    
+    """Protection statistics - Authorized users only"""
     try:
         conn = sqlite3.connect('/tmp/protection_bot.db')
         cursor = conn.cursor()
@@ -394,12 +370,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         conn.close()
 
+@authorized_only
 async def warned(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List warned users"""
-    # Check authorization first
-    if not await check_authorization(update, context):
-        return
-    
+    """List warned users - Authorized users only"""
     if update.effective_chat.type == "private":
         await update.message.reply_text("❌ *This command works in groups only!*", parse_mode='Markdown')
         return
@@ -438,7 +411,7 @@ async def warned(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
 async def protect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Monitor and protect against ban risks"""
+    """Monitor and protect against ban risks - Works for everyone in groups"""
     if not update.message or not update.effective_user:
         return
     
@@ -513,34 +486,35 @@ def main():
     logger.info("🛡️ Starting Ban Protection Bot...")
     logger.info(f"✅ BOT_TOKEN: {'Set' if BOT_TOKEN else 'Not Set'}")
     logger.info(f"✅ ALERT_CHAT_ID: {'Set' if ALERT_CHAT_ID else 'Not Set'}")
-    logger.info(f"✅ ALLOWED_USERS: {len(ALLOWED_USER_IDS) + len(ALLOWED_USERNAMES)} configured")
+    logger.info(f"✅ AUTHORIZED_USER_ID: {'Set' if AUTHORIZED_USER_ID else 'Not Set'}")
     
     if ALERT_CHAT_ID:
         logger.info(f"📧 Alerts will be sent to: {ALERT_CHAT_ID}")
     
+    if AUTHORIZED_USER_ID:
+        logger.info(f"🔐 Authorized user: {AUTHORIZED_USER_ID}")
+    else:
+        logger.warning("⚠️  AUTHORIZED_USER_ID not set - all users will have access")
+    
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Add command handlers with authorization
+    # Add command handlers (authorized only)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("alerts", alerts))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("warned", warned))
     
-    # Add message protection handler (for authorized users only)
+    # Add message protection handler (works for everyone in groups)
     application.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND, 
         protect_messages
     ))
-    
-    # Add a catch-all handler for unauthorized users that does nothing
-    # This prevents any response to unauthorized users
-    application.add_handler(MessageHandler(filters.ALL, handle_unauthorized), group=1)
-    
+
     # Start the bot
     try:
-        logger.info("✅ Bot is running with authorization...")
+        logger.info("✅ Bot is running and monitoring...")
         application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
