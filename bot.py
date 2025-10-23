@@ -2,7 +2,6 @@ import os
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import requests
 
 # Configure logging
 logging.basicConfig(
@@ -13,39 +12,49 @@ logger = logging.getLogger(__name__)
 
 # Get environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-ALLOWED_USER_IDS = os.environ.get('ALLOWED_USER_IDS', '').split(',')
-ALLOWED_USERNAMES = os.environ.get('ALLOWED_USERNAMES', '').split(',')
-API_BASE_URL = os.environ.get('API_BASE_URL', 'http://localhost:5000')
+ALLOWED_USER_IDS = [uid.strip() for uid in os.environ.get('ALLOWED_USER_IDS', '').split(',') if uid.strip()]
+ALLOWED_USERNAMES = [uname.strip().lstrip('@').lower() for uname in os.environ.get('ALLOWED_USERNAMES', '').split(',') if uname.strip()]
 
 def is_user_authorized(user_id: int, username: str) -> bool:
     """
     Check if user is authorized to use the bot
     """
-    # Remove @ from username if present and convert to lowercase
+    # Clean and prepare the username
     clean_username = username.lstrip('@').lower() if username else ""
     
     # Check if user ID is in allowed list
     if str(user_id) in ALLOWED_USER_IDS:
+        logger.info(f"User authorized by ID: {user_id}")
         return True
     
     # Check if username is in allowed list
-    if clean_username and clean_username in [u.lstrip('@').lower() for u in ALLOWED_USERNAMES if u]:
+    if clean_username and clean_username in ALLOWED_USERNAMES:
+        logger.info(f"User authorized by username: {clean_username}")
         return True
     
+    logger.warning(f"Unauthorized access - User ID: {user_id}, Username: {username}")
     return False
+
+async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is authorized and send message if not"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "No username"
+    
+    if not is_user_authorized(user_id, username):
+        await update.message.reply_text(
+            "❌ Unauthorized access. This bot is not available for public use."
+        )
+        return False
+    return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
+    # Check authorization first
+    if not await check_authorization(update, context):
+        return
+    
     user_id = update.effective_user.id
     username = update.effective_user.username
-    
-    # Check if user is authorized
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. You are not allowed to use this bot."
-        )
-        logger.warning(f"Unauthorized access attempt from user_id: {user_id}, username: {username}")
-        return
     
     welcome_text = """
 🤖 Welcome to KMJ Universal Cleaning Bot!
@@ -63,14 +72,8 @@ Use /help to see all available commands.
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /help is issued."""
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    
-    # Check if user is authorized
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. You are not allowed to use this bot."
-        )
+    # Check authorization first
+    if not await check_authorization(update, context):
         return
     
     help_text = """
@@ -87,14 +90,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def services(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show available cleaning services."""
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    
-    # Check if user is authorized
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. You are not allowed to use this bot."
-        )
+    # Check authorization first
+    if not await check_authorization(update, context):
         return
     
     services_text = """
@@ -121,14 +118,8 @@ Use /quote to get a free estimate!
 
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show contact information."""
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    
-    # Check if user is authorized
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. You are not allowed to use this bot."
-        )
+    # Check authorization first
+    if not await check_authorization(update, context):
         return
     
     contact_text = """
@@ -148,14 +139,8 @@ We're here to help! 🧹
 
 async def quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the quote process."""
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    
-    # Check if user is authorized
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. You are not allowed to use this bot."
-        )
+    # Check authorization first
+    if not await check_authorization(update, context):
         return
     
     quote_text = """
@@ -173,14 +158,8 @@ Please describe your cleaning needs and we'll get back to you with a quote withi
 
 async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the booking process."""
-    user_id = update.effective_user.id
-    username = update.effective_user.username
-    
-    # Check if user is authorized
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. You are not allowed to use this bot."
-        )
+    # Check authorization first
+    if not await check_authorization(update, context):
         return
     
     book_text = """
@@ -198,23 +177,30 @@ We'll confirm your booking and send you all the details!
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all other messages."""
+    # Check authorization first
+    if not await check_authorization(update, context):
+        return
+    
+    # Process the message for authorized users only
+    user_message = update.message.text
     user_id = update.effective_user.id
     username = update.effective_user.username
     
-    # Check if user is authorized
-    if not is_user_authorized(user_id, username):
-        await update.message.reply_text(
-            "❌ Unauthorized access. You are not allowed to use this bot."
-        )
-        return
-    
-    # Process the message for authorized users
-    user_message = update.message.text
     logger.info(f"Authorized user message - User: {username} ({user_id}): {user_message}")
     
-    # You can add your message processing logic here
-    response_text = f"Thank you for your message! We'll get back to you soon. 🧹"
+    response_text = "Thank you for your message! We'll get back to you soon. 🧹"
     await update.message.reply_text(response_text)
+
+async def handle_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all unauthorized access attempts."""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "No username"
+    
+    logger.warning(f"BLOCKED unauthorized access - User ID: {user_id}, Username: {username}")
+    
+    # Do not respond at all to unauthorized users
+    # This prevents them from knowing the bot exists
+    return
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors and handle them appropriately."""
@@ -241,10 +227,13 @@ def main():
     logger.info(f"Allowed User IDs: {ALLOWED_USER_IDS}")
     logger.info(f"Allowed Usernames: {ALLOWED_USERNAMES}")
     
+    if not ALLOWED_USER_IDS and not ALLOWED_USERNAMES:
+        logger.warning("No authorized users configured! Bot will reject all users.")
+    
     # Create the Application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    # Add handlers for authorized commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("services", services))
@@ -252,14 +241,18 @@ def main():
     application.add_handler(CommandHandler("quote", quote))
     application.add_handler(CommandHandler("book", book))
     
-    # Handle all other messages
+    # Handle messages from authorized users
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Add a catch-all handler for unauthorized users that does nothing
+    # This prevents any response to unauthorized users
+    application.add_handler(MessageHandler(filters.ALL, handle_unauthorized), group=1)
     
     # Add error handler
     application.add_error_handler(error_handler)
     
     # Start the Bot
-    logger.info("Bot is starting...")
+    logger.info("Bot is starting with strict authorization...")
     application.run_polling()
 
 if __name__ == '__main__':
